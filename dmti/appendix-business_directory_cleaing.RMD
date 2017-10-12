@@ -1,0 +1,89 @@
+---
+title: Business Directory Cleaning
+output: word_document
+---
+
+```{r classification, echo = FALSE, include = FALSE}
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+
+#Final_cleaning_numbers.csv andfinal_classification_numbers.csv comes from the SQL tables deepa.dmti_cleaning_numbers and deepa.dmti_classification_numbers.  The tables were created in the script #basefile-dmti-remove-duplicates, and based on the manual Excel cleaning of the supermarket category. #The classification numbers refer to the specific string names that were cleaned, and the cleaning numbers#refer to the entire dataset
+
+class.numbers = read.csv('dmti/final_classification_numbers.csv')
+class.numbers$convenience_corr <- 
+ifelse(class.numbers$convenience_corr=='true', 'TRUE', 'FALSE')
+
+cats = colnames(class.numbers)[3:6]
+class.numbers[,cats] <- ifelse(class.numbers[,cats]=='TRUE', 1, 0)
+class.numbers[,cats] <- ifelse(class.numbers[,cats]==1, class.numbers$total, 0)
+class.numbers = class.numbers[,-1]
+
+long.class = melt(class.numbers, id = 'source')
+long.class = long.class[which(long.class$value != 0),]
+
+colnames(long.class) = c('string','classification','number')
+rownames(long.class) = NULL
+
+write.csv(long.class, file = 'dmti/classification_numbers.csv')
+
+```
+
+
+```{r cleaning, echo = FALSE}
+cleaning.numbers = read.csv('dmti/final_cleaning_numbers.csv')
+
+cats = colnames(cleaning.numbers)[2:10]
+cleaning.numbers[,cats] <- ifelse(cleaning.numbers[,cats]==TRUE, 1, 0)
+cleaning.numbers[,cats] <- ifelse(cleaning.numbers[,cats]==1, cleaning.numbers$count, 0)
+
+#Transform data to long format
+long.nos = melt(cleaning.numbers, id = 'source')
+long.nos = long.nos[long.nos$variable != 'count' & long.nos$value!= 0,]
+
+long.nos$source2 = factor(long.nos$source, 
+                         levels = c('original','duplicates','manual'), 
+                         labels = c('original','duplicates','manual'))
+
+sums = long.nos %>% group_by(source2) %>% summarise(sum = sum(value)) %>% data.frame()
+
+long.nos$props =rep(NA, nrow(long.nos))
+long.nos$props[long.nos$source=='duplicates'] = 
+  long.nos$value[long.nos$source=='duplicates']/sums$sum[sums$source2=='duplicates']
+long.nos$props[long.nos$source=='original'] = 
+  long.nos$value[long.nos$source=='original']/sums$sum[sums$source2=='original']
+long.nos$props[long.nos$source=='manual'] = 
+  long.nos$value[long.nos$source=='manual']/sums$sum[sums$source2=='manual']
+```
+
+##**Introduction**
+
+Due to the well-known inaccuracy of business directory data, one year of data (2008) were manually cleaned to identify incorrectly classified stores that could affect our results.  In particular, we were concerned about incorrectly classified stores that should/should not belong to the numerator of accessibility measures, i.e. healthier stores.  As such we focused on correcting the ‘supermarket’ category above.  For this category, there were three principle issues that created the necessity for the manual cleaning: i) ambiguous store names resulting in misclassification of chain supermarkets; ii) supermarkets that were actually convenience stores; iii) lack of distinction between smaller grocery stores and larger supermarkets. 
+
+##**Methods**
+
+Verification involved use of external resources including, in the first instance, visiting the stores virtually using Google eye view (with a time lapse to the correct year).   As the visits were not always sufficient due to limited available years, inaccurate address or inability to find the store (particularly in rural areas), websites, Facebook pages, phone numbers, customer reviews and photos were used as additional evidence depending on what was available.  Based on the verification the outlet retained its supermarket classification with the addition of a chain name if missing, or it was classified as a grocery store or convenience store.  The grocery versus convenience store classification was ambiguous and only based on perceived size of the store and product content where available, and thus, for the primary analysis grocery stores were excluded. If there was insufficient evidence to speculate on the type of store was deemed ‘remove' and included only in sensitivity analyses; these uncertainties only comprised of grocery and convenience stores.  
+
+Three store name groups (‘marché’, ‘alimentation’ and ‘épicerie’) were found to be ambiguous and potentially masking unhealthy stores within the Supermarket category.  Together these comprised of 1531/1994 (77%) of outlets in the supermarket category in 2008. If no actual supermarkets were found, the process was stopped.  If at least one actual supermarket was found, I undertook the verification process for all stores in the store name group.  Ultimately, 10% verification was done on the ‘épicerie’ category and complete verification was done on `r class.numbers$total_cat[class.numbers$source=='marche' & class.numbers$total_cat > 0]` unique stores in the ‘marche’ category and `r class.numbers$total_cat[class.numbers$source=='alimentation'& class.numbers$total_cat > 0]` unique stores in the ‘marché’ category (Figure 1)
+
+![Figure 1](dmti/cleaning_process.png)
+
+##**Results**
+
+`r long.nos$value[long.nos$source == 'original' & long.nos$variable == 'supermarket'] - long.nos$value[long.nos$source == 'manual' & long.nos$variable == 'supermarket']` out of 1531 outlets were found to not actually be supermarkets despite being initially classified as such.  They were mainly re-classified as convenience stores (`r paste('n=', sum(class.numbers$convenience_corr), sep="")`, with slightly fewer deemed grocery stores (`r paste('n=', sum(class.numbers$grocery_corr), sep="")`) or marked for removal (`r long.nos$value[long.nos$source == 'manual' & long.nos$variable == 'remove']`) (Figure 2)
+ 
+```{r results, echo = FALSE, fig.width=8, fig.height=7} 
+ggplot(long.nos, aes(variable, source2, fill = value)) + geom_tile(color = 'darkgrey', size=1.5) +
+coord_flip() + 
+geom_label(aes(variable, source, label = paste(value,' (',round(props,2),')',sep="")), color = 'black', size = 7) +
+scale_fill_continuous(low = 'white', high = 'red', guide = FALSE) +
+labs(x = NULL, y = NULL, title = 'Figure 2: Cleaning Business Directory Data') +
+scale_y_discrete(labels = c('Original Data','Removed Duplicates','Additional Cleaning')) +
+theme(axis.text = element_text(color = 'black', size = 15),
+      axis.title = element_text(color = 'black', size = 14),
+      plot.title = element_text(size = 18)
+      panel.background = element_blank()) 
+```
+
+
+
