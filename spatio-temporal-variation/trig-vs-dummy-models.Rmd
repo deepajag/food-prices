@@ -1,0 +1,108 @@
+---
+title: "Alternate Seasonal Models"
+author: "Deepa"
+date: "10/31/2017"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("ggplot2")
+library("RPostgreSQL")
+library("cluster")
+library("splines")
+library('kml')
+library('maps')
+library('mapdata')
+library('maptools') 
+library('stringr')
+library('dplyr')
+library('reshape2')
+
+source('data_script.R')
+```
+
+##**Introduction**
+
+There are several approaches to modelling a seasonal time trend.  In the primary analysis, I used monthly indicator variables which allow the outcome (serving price) to vary flexibly each month.  Alternate approaches involve modelling seasonal cycles using trigonometric functions, as is common in time series literature.  In this sensitivity analysis, I compare the results for the different approaches.
+
+##**Method**
+
+The AICs of three trignometric models and the original monthly indicator-based model were compared. The alternative model forms were based on the seasonal model in Equation 1.
+
+Equation 1:
+$$E(y) = sin(2\pi/\omega*t)+cos(2\pi/\omega*t))$$
+$$\omega$$ in this case was one year, or 52 weeks, because the seasonal patterns were yearly.  $$t$$ was a running time index indicating the week and $$y$$ was the weekly mean serving price.  Two more complex models involved adding the subsequent harmonics, i.e. $$sin(4\pi/\omega*t)+cos(4\pi/\omega*t)$$ and $$sin(6\pi/\omega*t)+cos(6\pi/\omega*t)$$ to the base model displayed in Equation 1.
+
+The price values predicted from each model were also plotted.
+
+##**Results**
+
+The models all had good fit to estimate the seasonal trend, but the model with monthly dummies was superior based on AIC.  Arguable, the trignometric models were more general as the monthly-indicator-based model may overfit the data.  However, the results were similar, suggesting the monthly-indicators do still capture the general seasonal trend.  There was some gain to the increasingly complex trignometric models but the results were again similar.
+
+```{r alternate_models}
+fit.all.models = function(cat){
+all.rls = dat %>% filter(year != 2008) %>% group_by(type,periodid) %>% 
+summarise(mean.real = weighted.mean(real.price, weight)) %>% arrange(type,periodid) %>%
+mutate(index=1:n_distinct(periodid))
+all.rls$month = strftime(all.rls$periodid, format = '%m')
+all.rls$year = strftime(all.rls$periodid, format = "%Y")
+all.rls  = all.rls %>% filter(type==cat)
+
+per <- 52
+sin.plot1 <- lm(mean.real ~ sin(2*pi/per*index)+cos(2*pi/per*index), data = all.rls)
+
+sin.plot2 <- lm(mean.real ~ sin((2*pi/per)*index) + 
+                cos((2*pi/per)*index) +
+                sin((4*pi/per)*index) + 
+                cos((4*pi/per)*index), data=all.rls)
+
+sin.plot3 <- lm(mean.real ~ sin(2*pi/per*index) + 
+                cos(2*pi/per*index) +
+                sin(4*pi/per*index) + 
+                cos(4*pi/per*index) +
+                sin(6*pi/per*index) + 
+                cos(6*pi/per*index),data=all.rls)
+
+indicator.month <- lm(mean.real ~ as.factor(month), data=all.rls)
+
+aic.matrix = matrix(c(AIC(indicator.month),AIC(sin.plot1),AIC(sin.plot2), AIC(sin.plot3)), ncol = 1)
+rownames(aic.matrix) <- c("original","trig1","trig2","trig3")
+m = aic.matrix 
+
+all.rls$normal.sin1 <- predict(sin.plot1, data = all.rls)
+all.rls$normal.sin2 <- predict(sin.plot2, data = all.rls)
+all.rls$normal.sin3 <- predict(sin.plot3, data = all.rls)
+all.rls$month.indicator <- predict(indicator.month, data = all.rls)
+
+g = ggplot(all.rls) + 
+  geom_line(aes(periodid, mean.real, color = "raw"),alpha=0.3) + 
+  geom_line(aes(periodid, month.indicator, color = "original"), size=4) +
+  geom_line(aes(periodid, normal.sin1, color = "trig1"), size=1) +
+  geom_line(aes(periodid, normal.sin2, color = "trig2"), size=1) +
+  geom_line(aes(periodid, normal.sin3, color = "trig3"), size=1) +
+  scale_colour_manual(name="Legend", 
+  values = c('raw' = "black",  "original"="orange","trig1"= "blue","trig2"= "yellow", "trig3"="purple")) +
+  labs(x = 'Date',y='Mean Serving Price (cents)', title = paste("Modelling Seasonal Trend - ", cat,sep=""))
+
+return(list(m,g))
+}
+
+
+cat="fruit"
+knitr::kable(fit.all.models(cat)[[1]], caption = "Model AICs (Fruits)")
+fit.all.models(cat)[[2]]
+cat="vegetable"
+knitr::kable(fit.all.models(cat)[[1]], caption = "Model AICs (Vegetables)")
+fit.all.models(cat)[[2]]
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

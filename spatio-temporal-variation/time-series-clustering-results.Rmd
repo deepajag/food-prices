@@ -1,0 +1,154 @@
+---
+title: "Time Series Results"
+author: "Deepa"
+date: "10/31/2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("ggplot2")
+library("RPostgreSQL")
+library("cluster")
+library("splines")
+library('kml')
+library('maps')
+library('mapdata')
+library('maptools') 
+library('stringr')
+library('dplyr')
+library('reshape2')
+
+source('data_script.R')
+```
+
+##Description
+
+
+##Overall time series
+The overall time series has a clear seasonal trend with several modelling options. There does not seem to be a difference compared to using monthly dummies. Most of the variance in the overall time series is explained by season, with very little systematic variation left after.
+
+```{r overall_time_series}
+all.rls = dat %>% filter(year != 2008) %>% group_by(periodid, type) %>% 
+  summarise(mean.real = weighted.mean(real.price, weight))
+
+all.rls$flex.predict = predict(lm(mean.real ~ bs(periodid, 52)*type, data = all.rls), all.rls)
+
+ggplot(all.rls) +
+        geom_line(aes(periodid, mean.real), alpha = 0.3) +
+        geom_line(aes(periodid, flex.predict)) +
+        scale_x_date(date_breaks = "1 year") +
+        labs(x = "Date", y = "Mean Serving Price (cents)", title = "Raw Price Time Series") +
+        scale_color_discrete(name = "Estimate") + facet_wrap(~type)
+```
+
+```{r model_seasonal_trend}
+###Normalize prices
+all.rls$stdprice.real = scale(all.rls$mean.real)
+season.model <- lm(stdprice.real ~ as.factor(month),data=all.rls)
+all.rls$normal.month <- predict(season.model, data = all.rls)
+
+ggplot(all.rls) + geom_line(aes(periodid, stdprice.real), color = 'pink') + 
+  geom_line(aes(periodid, normal.month), color = 'orange', size=4) +
+  geom_line(aes(periodid, normal.sin1), color = 'red', size=1) +
+  geom_line(aes(periodid, normal.sin2), color = 'purple', size=1) +
+  geom_line(aes(periodid, normal.sin3), color = 'green', size=1) +
+  geom_line(aes(periodid, normal.sin4), color = 'blue', size=1) 
+
+
+#Determine variance explained by season and ensure random series obtained after deseason
+all.rls$subtract.season = all.rls$stdprice.real - all.rls$normal.sin3
+var.explained.by.season = summary(sin.plot3)$r.squared
+all.rls$diff.season = c(NA,diff(all.rls$subtract.season))
+
+ggplot(all.rls) + geom_line(aes(periodid, stdprice.real), color = 'purple', alpha = 0.6) +
+geom_line(aes(periodid, diff.season), color = 'black')  + ggtitle("De-seasoned Trend")
+```
+
+`r var.explained.by.season` of variance explained by seasonal trend in overall time series.  There is effectively no time trend.
+
+```{r pressure, echo=FALSE}
+#Test for linear and quadratic time trend
+time.trend = lm(diff.season ~ bs(as.numeric(periodid)), data = all.rls)
+time.prediction = c(NA,predict(time.trend))
+all.rls$time = time.prediction
+ggplot(all.rls) + geom_line(aes(periodid, diff.season), color = 'purple', alpha = 0.6) +
+  geom_line(aes(periodid, time), color = 'black')
+```
+
+##  Regional time series
+These were estimated through the same models as above with an interaction term for region. Random series were NOT obtained after deasoning at the region-level.The proportion of variance due to seasonal trend was the variance of predicted prices from the season model divided by the variance for the overall observed price series, as obtained from the overall model.  This variance was identical to the R-squared obtained from individual models on each RLS.
+
+The seasonal trend variance ranged from explaining around 30 to 80 of the overall time series variance depending on the region.
+
+```{r regional}
+####Weekly time series
+all.rls = dat %>% filter(type==cat) %>% group_by(periodid, rls_code) %>% 
+          summarise(mean.nominal = weighted.mean(serv_price_correct, weight), 
+          mean.real = weighted.mean(real.price, weight))
+all.rls$year = strftime(all.rls$periodid, format = "%Y")
+all.rls$month = strftime(all.rls$periodid, format = "%m")
+all.rls$stdprice.real = scale(all.rls$mean.real)
+ggplot(all.rls) + geom_line(aes(periodid, mean.real, color = rls_code)) + ggtitle("Overall Regional Time Series")
+
+regional.seasonal.trends <- lm(stdprice.real~ as.factor(month)*rls_code, data=all.rls) 
+all.rls$seasonal <- predict(regional.seasonal.trends, data = all.rls)
+
+#Determine regional variance explained by season and 
+#check if random series obtained after deseason
+all.rls$subtract.season = all.rls$stdprice.real - all.rls$seasonal
+all.rls$diff.season = c(NA,diff(all.rls$subtract.season))
+ggplot(all.rls) + geom_line(aes(periodid, 
+                                diff.season,
+                                color = rls_code) )
+
+rls.data = split(all.rls, all.rls$rls_code)
+
+####FIGURE THIS OUT - OK, formula correct
+seasonal.variance = function(x){
+variance = var(x$seasonal)/var(x$stdprice.real)
+return(variance)
+}
+
+seasonal.variances = abs(unlist(sapply(rls.data, seasonal.variance)))
+
+###Determine overlap of above seasonal variances with variance on each model individually - almost EXACTLY SAME
+check.var = function(x) {
+  summary(lm(stdprice.real~ as.factor(month), data=x))$r.squared
+  } 
+
+individual.variances = abs(unlist(sapply(rls.data, check.var)))
+compare.variances = data.frame(full.model = seasonal.variances, ind.model = individual.variances)                          
+compare.variances$diff = abs(compare.variances$full.model - compare.variances$ind.model)
+ggplot(compare.variances, aes(full.model, ind.model)) + geom_point() + 
+ggtitle("Compare Interaction model-extracted variance to Restricted models")
+
+
+```
+
+Given that adjusting for season did not result in a random series at the region level (unlike overall), the time trend was also estimated and removed.  The variances explained by time were lower than season but not insigifncant. After remove the time trend, we approached a more random series for each region.
+
+```{r time}
+#Test for linear and quadratic time trend on 1st difference of season- MOST HAVE TIME TREND
+time.trend = lm(diff.season ~ bs(as.numeric(periodid))*rls_code, data = all.rls)
+time.prediction = c(NA,predict(time.trend))
+all.rls$time = time.prediction
+
+rls.data = split(all.rls, all.rls$rls_code)
+time.variance = function(x){
+  variance = var(x$time, na.rm = TRUE)/var(x$stdprice.real, na.rm = TRUE)
+  return(variance)
+}
+
+time.variances = abs(unlist(sapply(rls.data, time.variance)))
+ggplot(all.rls) + geom_line(aes(periodid, time, color = factor(rls_code))) + ggtitle("Time Trends")
+
+ggplot(all.rls[all.rls$rls_code== "0302" | all.rls$rls_code=="1606",]) + geom_point(aes(periodid, time, color = factor(rls_code))) +
+geom_line(aes(periodid, diff.season, color = factor(rls_code))) + ggtitle("Example of high/low variance explained by time")
+
+#Now should have almost random trend
+all.rls$de.season.time = all.rls$diff.season - all.rls$time
+ggplot(all.rls) + geom_line(aes(periodid, de.season.time, color = factor(rls_code))) +
+  ggtitle("De-season and De-trend")
+
+```
