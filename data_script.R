@@ -11,25 +11,47 @@ library('stringr')
 library('data.table')
 library('dplyr')
 
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname = "obesity", host = 'benzina')
+
+dat <- dbGetQuery(con, paste("SELECT week, periodid, rls_code,  
+                  bannerid, storeid,
+                  serv_price_correct,
+                  bin, itemdesc, type,
+                  weight FROM deepa.fv_servingprice_geom_stdbasket_wts 
+                  WHERE bannerid <> '377' AND pharmacy = 'FALSE';"))
+
+dmti = dbGetQuery(con, "SELECT poi_id, store, year, 
+                        supercentre, convenience, 
+                        supermarket, grocery, produce, 
+                        fastfood, pharmacy, 
+                        remove, marche, alimentation, 
+                        rls_code FROM deepa.dmti_full_correct;")
+
+OK <- dbDisconnect(con);
 
 ###Monthly exchange rates
 exchange.rates = read.csv('exchange.rates.formatted.csv', header = TRUE)
 exchange.rates$date = as.Date(exchange.rates$date, format = "%Y-%m-%d")
+exchange.rates$year <- strftime(exchange.rates$date, format = "%Y")
+exchange.rates$month<- strftime(exchange.rates$date, format = "%m")
+exchange.rates$lag <- c(NA,tail(exchange.rates$scaled_means,-1))
 
 ###Join CPI information and derive 'real price'
 cpi = read.csv('cpi test.csv',header=TRUE)
 cpi$date = as.Date(paste(as.character(cpi$date),"01",sep="-"), format = "%Y-%m-%d")
-colnames(cpi)[3] <- 'vegetable'; cpi = melt(cpi, id=c("date"))
-names(cpi) <- c('date','type','cpi')
-cpi$year = strftime(cpi$date, format = "%Y")
-cpi$month = strftime(cpi$date, format = '%m')
-dat$month = strftime(dat$periodid, format = '%m')
-dat$year = strftime(dat$periodid, format = "%Y")
-dat = left_join(dat, cpi,c('year','month','type'))
-head(cpi[cpi$year=="2010" & cpi$month=="11",])
+colnames(cpi)[3] <- 'vegetable'; cpi = melt(cpi, id=c("date"));  names(cpi) <- c('date','type','cpi')
+cpi$year = strftime(cpi$date, format = "%Y"); cpi$month = strftime(cpi$date, format = '%m')
+cpi.monthly.means = cpi %>% filter(year == "2010") %>% group_by(type, year, month) %>% summarise(mean.month.cpi = mean(cpi))
 
+dat$month = strftime(dat$periodid, format = '%m'); dat$year = strftime(dat$periodid, format = "%Y")
+dat <- dat %>% left_join(cpi, c("type","month","year"))
+dat = dat %>% select(-date)
 
-dat$real.price = dat$serv_price_correct*mean(dat$cpi[dat$year=='2010'])/dat$cpi 
+dat = dat %>% left_join(month.cpi, c("month", "type"))
+dat = dat %>% select(-year.y) %>% rename(year = year.x)
+dat$real.price = dat$serv_price_correct*dat$mean.month.cpi/dat$cpi 
+
 
 ##Truncate the bins based on low and high prices##
 bin.split = split(dat, dat$bin, drop = TRUE)
@@ -63,73 +85,71 @@ prop.discard = length(outlier.vector)/length(unique(dat$itemdesc)) ##Per bin it 
 dat = dat[!(dat$itemdesc %in% outlier.vector),]
 
 
-
 # #############################Business directory data#############################
-# ###Find duplicate POI_IDs and ID's with multiple RLS
-# multiple.rls = dmti %>% group_by(poi_id) %>% count(count = n_distinct(rls_code)) %>% filter(count > 1)
-# nrow(multiple.rls) ##Number with more than 1 RLS - EXCLUDE FOR NOW?
-# dmti = dmti[!(dmti$poi_id %in% multiple.rls$poi_id ), ]
-# 
-# ###Restrict to supermarket category non-2008
-# all.dat.0913 = dmti[which(dmti$year != 2008),]
-# supermarkets = all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),]
-# nrow(supermarkets) == nrow(all.dat.0913[all.dat.0913$supermarket=='TRUE',])
-# 
-# #Split by year
-# yearly.supermarket = split(supermarkets, supermarkets$year)
-# x = yearly.supermarket[[2]]
-# 
-# #For each year, randomly select x% in appropriate categories to become supermarkets, grocery, convenience and remove
-# ##The initial probabilities are derived from the 2008 data validation
-# a = 0.24; b = 0.27; c = 0.18; d = 0.23; e = 0.25; f = 0.15
-# cats = c('supermarket','convenience', 'grocery', 'remove')
-# probs.alim = c(1-sum(a,b,c),a,b,c)
-# probs.marche = c(1-sum(d,e,f),d,e,f)
-# 
-# ##The function randomly assigns new categories based on above probabilities for the appropriate storenames for each year
-# replace.rows = function(x){
-# set.seed(123)
-#   
-# original.rows = nrow(x)
-# 
-# alim.data = x[which(x$alimentation=='TRUE' & x$marche=='FALSE' & is.na(x$store)),]  ##Required specification to avoid dups later
-# total.alim = nrow(alim.data)
-# alim.data$new.cat = sample(cats, size = total.alim, replace= TRUE, prob = probs.alim)
-# 
-# alim.data$supermarket <- ifelse(alim.data$new.cat=='supermarket', 'TRUE', 'FALSE')
-# alim.data$grocery <- ifelse(alim.data$new.cat=='grocery', 'TRUE', 'FALSE')
-# alim.data$convenience <- ifelse(alim.data$new.cat=='convenience', 'TRUE', 'FALSE')
-# alim.data$remove <- ifelse(alim.data$new.cat=='remove', 'TRUE', 'FALSE')
-# nrow(alim.data)
-# 
-# marche.data = x[which(x$marche=='TRUE' & is.na(x$store)),]
-# total.marche = nrow(marche.data)
-# 
-# marche.data$new.cat = sample(cats, size = total.marche, replace= TRUE, prob = probs.marche)
-# 
-# marche.data$supermarket <- ifelse(marche.data$new.cat=='supermarket', 'TRUE', 'FALSE')
-# marche.data$grocery <- ifelse(marche.data$new.cat=='grocery', 'TRUE', 'FALSE')
-# marche.data$convenience <- ifelse(marche.data$new.cat=='convenience', 'TRUE', 'FALSE')
-# marche.data$remove <- ifelse(marche.data$new.cat=='remove', 'TRUE', 'FALSE')
-# 
-# revised.dat = rbind(marche.data, alim.data)
-# x = rbind(x,subset(revised.dat,select = -new.cat))
-# x = x %>% arrange(poi_id) %>%
-#   group_by(poi_id) %>%
-#   filter(row_number() == 1)
-# 
-# if (nrow(x) != original.rows) warning('not adding up')
-# 
-# return(x)
-# }
-# 
-# #New data to replace old data for 2009-2013 - with checks
-# ###Generate new data
-# new.0913 = do.call(rbind,lapply(yearly.supermarket,replace.rows))
-# nrow(all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),]) == nrow(new.0913)
-# ###replace 2009-2013 supermarket data
-# all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),] <- new.0913
-# nrow(all.dat.0913[all.dat.0913$supermarket=='TRUE',]) == nrow(new.0913)
-# ###replace primary data
-# dmti[dmti$year != 2008 & dmti$supermarket=='TRUE',] <- new.0913
+###Find duplicate POI_IDs and ID's with multiple RLS
+multiple.rls = dmti %>% group_by(poi_id) %>% count(count = n_distinct(rls_code)) %>% filter(count > 1)
+nrow(multiple.rls) ##Number with more than 1 RLS - EXCLUDE FOR NOW?
+dmti = dmti[!(dmti$poi_id %in% multiple.rls$poi_id ), ]
 
+###Restrict to supermarket category non-2008
+all.dat.0913 = dmti[which(dmti$year != 2008),]
+supermarkets = all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),]
+nrow(supermarkets) == nrow(all.dat.0913[all.dat.0913$supermarket=='TRUE',])
+
+#Split by year
+yearly.supermarket = split(supermarkets, supermarkets$year)
+
+#For each year, randomly select x% in appropriate categories to become supermarkets, grocery, convenience and remove
+##The initial probabilities are derived from the 2008 data validation
+a = 0.24; b = 0.27; c = 0.18; d = 0.23; e = 0.25; f = 0.15
+cats = c('supermarket','convenience', 'grocery', 'remove')
+probs.alim = c(1-sum(a,b,c),a,b,c)
+probs.marche = c(1-sum(d,e,f),d,e,f)
+
+##The function randomly assigns new categories based on above probabilities for the appropriate storenames for each year
+replace.rows = function(x){
+set.seed(123)
+
+original.rows = nrow(x)
+
+alim.data = x[which(x$alimentation=='TRUE' & x$marche=='FALSE' & is.na(x$store)),]  ##Required specification to avoid dups later
+total.alim = nrow(alim.data)
+alim.data$new.cat = sample(cats, size = total.alim, replace= TRUE, prob = probs.alim)
+
+alim.data$supermarket <- ifelse(alim.data$new.cat=='supermarket', 'TRUE', 'FALSE')
+alim.data$grocery <- ifelse(alim.data$new.cat=='grocery', 'TRUE', 'FALSE')
+alim.data$convenience <- ifelse(alim.data$new.cat=='convenience', 'TRUE', 'FALSE')
+alim.data$remove <- ifelse(alim.data$new.cat=='remove', 'TRUE', 'FALSE')
+
+
+marche.data = x[which(x$marche=='TRUE' & is.na(x$store)),]
+total.marche = nrow(marche.data)
+
+marche.data$new.cat = sample(cats, size = total.marche, replace= TRUE, prob = probs.marche)
+
+marche.data$supermarket <- ifelse(marche.data$new.cat=='supermarket', 'TRUE', 'FALSE')
+marche.data$grocery <- ifelse(marche.data$new.cat=='grocery', 'TRUE', 'FALSE')
+marche.data$convenience <- ifelse(marche.data$new.cat=='convenience', 'TRUE', 'FALSE')
+marche.data$remove <- ifelse(marche.data$new.cat=='remove', 'TRUE', 'FALSE')
+
+revised.dat = rbind(marche.data, alim.data)
+x = rbind(x,subset(revised.dat,select = -new.cat))
+x = x %>% arrange(poi_id) %>%
+  group_by(poi_id) %>%
+  filter(row_number() == 1)
+
+if (nrow(x) != original.rows) warning('not adding up')
+
+return(x)
+}
+
+#New data to replace old data for 2009-2013 - with checks
+###Generate new data
+new.0913 = do.call(rbind,lapply(yearly.supermarket,replace.rows))
+nrow(all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),]) == nrow(new.0913)
+###replace 2009-2013 supermarket data
+all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),] <- new.0913
+nrow(all.dat.0913[all.dat.0913$supermarket=='TRUE',]) == nrow(new.0913)
+###replace primary data
+dmti[dmti$year != 2008 & dmti$supermarket=='TRUE',] <- new.0913
+head(dmti)
