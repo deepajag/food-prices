@@ -1,0 +1,452 @@
+---
+chunk_output_type: console
+editor_options: null
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = FALSE,warning=FALSE, message=FALSE)
+pacman::p_load(ggplot2,RPostgreSQL,cluster,splines,kml,longitudinalData,maps,mapdata,maptools,stringr,data.table,dplyr,reshape2,multiwayvcov,lmtest, rgdal, tmap, sjPlot, lme4)
+setwd('~/analysis_tmp/Nielsen')
+load('data.RData')
+gg.theme = function(g){
+p = g + theme(strip.text.x = element_text(size=12, face="bold", family="CenturySch"),
+      axis.text = element_text(size=10, color = "black",family="CenturySch"),
+      plot.title = element_text(size=11,  family="CenturySch", face="bold"),
+      panel.background = element_rect(fill="snow2", colour = "black"),
+      panel.grid = element_blank(), axis.title = element_text(size=11, color = "black",family="CenturySch"))
+return(p)
+}
+
+labels <- c(fruit = "Fruit", vegetable = "Vegetable")
+values = c("steelblue3", "tomato4")
+```
+
+##*Descriptives*
+```{r descriptives}
+##Missing Data
+complete.rls = dat %>% 
+              filter(year != '2008') %>%
+              group_by(rls_code) %>% 
+              summarise(weeks = n_distinct(periodid)) %>%
+              mutate(no.wks.missing = max(weeks) - weeks, prop = 1-weeks/max(weeks))
+
+complete.rls.codes <- complete.rls %>% 
+                      filter(prop <= 0.11) %>% 
+                      select(rls_code)
+
+dmti.overall = dmti %>% group_by(year) %>% 
+summarise(no_supercentre = sum(supercentre==TRUE), no_convenience = sum(convenience==TRUE), no_supermarket = sum(supermarket==TRUE),no_fastfood = sum(fastfood==TRUE), no_pharmacy = sum(pharmacy==TRUE)) %>% mutate(mfrei = (no_supermarket + no_supercentre)/(no_pharmacy + no_convenience + no_supermarket + no_fastfood)) %>% data.frame()
+
+dmti.sum = dmti %>% group_by(rls_code,year) %>% 
+  summarise(no_supercentre = sum(supercentre==TRUE), no_convenience = sum(convenience==TRUE), no_supermarket = sum(supermarket==TRUE),no_fastfood = sum(fastfood==TRUE), no_grocery = sum(grocery==TRUE),no_pharmacy = sum(pharmacy==TRUE)) 
+
+dmti.sum$mfrei = (dmti.sum$no_supermarket + dmti.sum$no_supercentre)/(dmti.sum$no_pharmacy + dmti.sum$no_convenience + dmti.sum$no_supermarket + dmti.sum$no_fastfood)
+
+##Means by region
+dmti.sum.rls = dmti.sum %>% group_by(year) %>% summarise(m_supercentre = mean(no_supercentre), m_convenience = mean(no_convenience), m_supermarket = mean(no_supermarket),m_fastfood = mean(no_fastfood), m_pharmacy = mean(no_pharmacy)) %>% data.frame()
+
+rls.means = dat %>% filter(rls_code %in% complete.rls.codes$rls_code & year != 2008) %>% group_by(type,rls_code,periodid,year,bannerid) %>% summarise(mean.real = weighted.mean(real.price,weight), no.stores = n_distinct(storeid))
+rls.means$year=as.numeric(rls.means$year)
+
+rls.means = rls.means %>% left_join(dmti.sum)
+rls.means = rls.means %>% left_join(census.ts)
+rls.means$super.density = (rls.means$no_supermarket/rls.means$predict.pop)*1000
+
+rls.means$month = factor(strftime(rls.means$periodid, format = "%m"))
+rls.means$year = factor(rls.means$year)
+rls.means$bannerid = factor(rls.means$bannerid)
+rls.means$super.density2 = rls.means$super.density^2
+
+##Overall descriptives
+overall.mean = dat %>% group_by(type) %>%
+  summarise(real.price = weighted.mean(real.price, weight,na.rm=TRUE)) 
+mean.by.year = dat %>% group_by(year,type) %>% 
+  summarise(real.price = weighted.mean(real.price, weight,na.rm=TRUE)) %>% arrange(type)
+
+mean.by.year.reshape = mean.by.year %>% dcast(year ~ type) %>% filter(year != "2008")
+
+##Regional descriptives
+rls.descriptive = dat %>% group_by(type, rls_code) %>%
+  summarise(real.price = weighted.mean(real.price, weight,na.rm=TRUE)) %>%
+  arrange(type,real.price)
+
+# The average price of the standard basket varied across regions with a standard deviation of `r round(sd(rls.means$real.price[rls.means$type=='fruit']),2)` for fruits and  `r round(sd(rls.means$real.price[rls.means$type=='vegetable']),2)` for vegetables. For fruits, the lowest mean regional price was `r round(min(rls.means$real.price[rls.means$type=='fruit']),2)`  and the maximum was `r round(max(rls.means$real.price[rls.means$type=='fruit']),2)` cents per serving. For vegetables, these values were `r round(min(rls.means$real.price[rls.means$type=='vegetable']),2)` and  `r round(max(rls.means$real.price[rls.means$type=='vegetable']),2)` cents per serving.
+
+```
+Of the `r length(unique(dat$rls_code))` regions with price information, `r length(unique(complete.rls$rls_code[complete.rls$prop <= 0.11]))` had 10% or fewer weeks with missing data and were thus available for analysis. The overall mean price per standard serving for `r noquote(paste(unique(overall.mean$type)[1],"s",sep=""))` was `r round(overall.mean$real.price[overall.mean$type==unique(overall.mean$type)[1]],2)` cents, while for `r noquote(paste(unique(overall.mean$type)[2],"s",sep=""))` it was `r round(overall.mean$real.price[overall.mean$type==unique(overall.mean$type)[2]],2)` cents. The inflation-adjusted prices were relatively consistent between 2008 and 2013 (Table 1).  
+
+The number of food outlets of all types increased over time, as did the modified food retail index (Table 2).  The average number of supermarkets per region was `r round(mean(dmti.sum$no_supermarket[dmti.sum$year=="2009"]),2)` (SD =`r round(sd(dmti.sum$no_supermarket[dmti.sum$year=="2009"]),2)`) in 2009 and `r  round(mean(dmti.sum$no_supermarket[dmti.sum$year=="2013"]),2)` (SD =`r round(sd(dmti.sum$no_supermarket[dmti.sum$year=="2013"]),2)`) by 2013.  The mean supermarket density per 1000 people also rose from  `r  round(mean(rls.means$super.density[rls.means$year=="2009"]),3)`(SD =`r  round(sd(rls.means$super.density[rls.means$year=="2009"]),3)`) in 2009 to `r round(mean(rls.means$super.density[rls.means$year=="2013"]),3)`(SD =`r  round(sd(rls.means$super.density[rls.means$year=="2013"]),3)`) in 2013, and the mean regional modified food retail index increased from `r  round(mean(dmti.sum$mfrei[dmti.sum$year=="2009"]),3)`(SD =`r  round(sd(dmti.sum$mfrei[dmti.sum$year=="2009"]),3)`) in 2009 to `r round(mean(dmti.sum$mfrei[dmti.sum$year=="2013"]),3)`(SD =`r  round(sd(dmti.sum$mfrei[dmti.sum$year=="2013"]),3)`) in 2013. 
+
+
+```{r sumtables}
+knitr::kable(mean.by.year.reshape[mean.by.year.reshape$year != "2008",], caption="Table 1: Mean Standard Basket Serving Price by Year (cents)")
+knitr::kable(dmti.overall[dmti.overall$year != "2008",], caption="Table 2:Total Number of Food Outlets in Quebec")
+```
+
+##*Relationship between accessibility and affordability*
+MfREI did not appear to be related to mean regional price overall, though was potentially negatively associated with vegetables (Figure 1).  Similarly, there was no apparent linear or non-linear relationship with supermarket density (Figure 2). 
+
+```{r includeplots}
+g.mfrei = ggplot(rls.means %>% group_by(rls_code,year,type) %>% summarise(mean=mean(mean.real), mfrei = mean(mfrei)), aes(log(mfrei),mean,color=type)) + geom_point(alpha=0.6) + labs(title="Figure 1: Regional Mean Price vs Regional MfRei", x="Log of MfREi", y="Mean Price per Serving (cents)") + scale_color_manual(name="Type", labels=labels, values=values) + geom_smooth(aes(group=type), method="lm",size=1.5)
+
+tiff("paper1-figures/figure1.tiff",units="in", height=5, width=8, res=300)
+gg.theme(g.mfrei)
+dev.off()
+
+g.density = ggplot(rls.means %>% group_by(rls_code,year,type) %>% summarise(mean=mean(mean.real), density = mean(super.density)), aes(log(density),mean,color=type)) + geom_point(alpha=0.6) + labs(title="Figure 2: Regional Mean Price vs Regional Supermarket Density", x="Log of Density (Supermarkets per 1000 people)", y="Mean Price per Serving (cents)") + scale_color_manual(name="Type", labels=labels, values=values) + geom_smooth(aes(group=type), method="lm",size=1.5)
+
+tiff("paper1-figures/figure2.tiff",units="in", height=5, width=8, res=300)
+gg.theme(g.density)
+dev.off()
+
+#Mfrei by price crude relationship by strata
+# g.cat.density = ggplot(rls.means[!is.na(rls.means$super.cat),], aes(super.cat,mean.real,color=type)) + geom_boxplot() + labs(y = "Mean Price per Serving (cents)", x="Number of Supermarkets (Range)", title="Figure 3a: Mean Price by Categorized Number of Supermarkets")
+
+##Raw correlations
+# cor.mfrei.fruit = cor(rls.means$mean.real[rls.means$type=="fruit"],rls.means$mfrei[rls.means$type=="fruit"],method="pearson")
+# cor.mfrei.veg = cor(rls.means$mean.real[rls.means$type=="vegetable"],rls.means$mfrei[rls.means$type=="vegetable"],method="pearson")
+# cor.density.fruit = cor(rls.means$mean.real[rls.means$type=="fruit"],rls.means$super.density[rls.means$type=="fruit"],method="pearson")
+# cor.density.veg = cor(rls.means$mean.real[rls.means$type=="vegetable"],rls.means$super.density[rls.means$type=="vegetable"],method="pearson")
+# 
+# correlations = data.frame(Fruit=rbind(cor.mfrei.fruit,cor.density.fruit),Vegetable= rbind(cor.mfrei.veg,cor.density.veg))
+# rownames(correlations) = c("MfREI","Supermarkets/1000")
+# knitr::kable(correlations, caption="Table 3: Pearson Correlations between Accessibility and Affordability Indicators")
+
+```
+
+The largest improvement in model fit occured after including the dummy variables for chain. There was minimal improvement in model fit after including the other regional characteristics (Supplemental File 1: Tables 1,2). For the remainder of the results we present the estimates associated with this model, which adjusted for month, year and chain, with random intercepts for region.
+
+```{r modelling}
+#rls.means$rls_year <- factor(paste(rls.means$rls_code, rls.means$year, sep=""))
+####################FINAL MODELLING##################
+##SUPERMARKET DENSITY
+get.results.clustered.se = function(ds, xvar="super.density", type="fruit"){
+m =  lm(as.formula(paste0("log(mean.real)", " ~ ", xvar, "+ year + month + bannerid")), data = ds)
+#vcov1 <- cluster.vcov(m,ds$fsa)
+#vcov2 <- cluster.vcov(m,ds$fsa_year)
+#new.se1 = coeftest(m, vcov1);
+#new.se2 = coeftest(m, vcov2);
+# coefficient1 = round(new.se1[xvar,'Estimate'],3)
+# coefficient1.ci = round(new.se1[xvar,'Estimate'] + new.se1[xvar,'Std. Error']*c(-1,1)*qnorm(0.95),3)# 
+# coefficient2 = round(new.se2[xvar,'Estimate'],3)
+# coefficient2.ci = round(new.se2[xvar,'Estimate'] + new.se2[xvar,'Std. Error']*c(-1,1)*qnorm(0.95),3)
+
+crude.ci = round(confint(m)[2,],3)
+
+m_re1 =  lmer(as.formula(paste0("log(mean.real)", " ~ ", xvar, " + year + month + bannerid + (1 | rls_code)")), data = ds) 
+coefficient_re1 = summary(m_re1 )$coefficients[xvar,1]
+confint_re1 = confint(m_re1 , method="Wald")[xvar,]
+
+# results = data.frame(rbind(c(c=m$coefficients[xvar],ci=crude.ci), c(c = coefficient1, ci = coefficient1.ci),c(c = coefficient2,ci = coefficient2.ci), c(c =coefficient_re1,ci=confint_re1),c(coefficient_re2,confint_re2)))
+results = data.frame(rbind(c(c=m$coefficients[xvar],ci=crude.ci), c(c =coefficient_re1,ci=confint_re1)))
+results$measure=rep(xvar, nrow(results))
+results$type = rep(type,nrow(results))
+results$level= c("OLS", "RE_RLS")
+# results$level= c("OLS", "Cluster_RLS", "Cluster_RLSYr", "RE_RLS", "RE_RLSYr")
+return(results)
+}
+
+f.cluster.density = get.results.clustered.se(ds = rls.means[rls.means$type=="fruit",], xvar="super.density", type="fruit") %>% rename(coefficient = c.super.density, low.ci = ci.2.5.., high.ci = ci.97.5.. )
+v.cluster.density = get.results.clustered.se(ds = rls.means[rls.means$type=="vegetable",], xvar="super.density", type="vegetable") %>% rename(coefficient = c.super.density, low.ci = ci.2.5.., high.ci = ci.97.5.. )
+f.cluster.mfrei = get.results.clustered.se(ds = rls.means[rls.means$type=="fruit",], xvar="mfrei", type="fruit") %>% rename(coefficient = c.mfrei, low.ci = ci.2.5.., high.ci = ci.97.5.. )
+v.cluster.mfrei = get.results.clustered.se(ds = rls.means[rls.means$type=="vegetable",], xvar="mfrei", type="vegetable") %>% rename(coefficient = c.mfrei, low.ci = ci.2.5.., high.ci = ci.97.5.. )
+
+
+all.cluster = data.frame(rbind(f.cluster.density, v.cluster.density, f.cluster.mfrei, v.cluster.mfrei))
+ggplot(all.cluster %>% filter(level != 'OLS'), aes(level,coefficient, group=level, color=level)) + geom_point(size=3) + geom_errorbar(aes(ymin=low.ci,ymax=high.ci), width=0.2, size=2) + geom_hline(yintercept=0) + coord_flip() + facet_wrap(~type + measure)
+
+rls.means$super.cat = cut(rls.means$super.density,c(as.numeric(summary(rls.means$super.density)[1]), as.numeric(summary(rls.means$super.density)[2]),as.numeric(summary(rls.means$super.density)[4]), as.numeric(summary(rls.means$super.density)[6])))
+
+rls.means$mfrei.cat = cut(rls.means$mfrei,c(as.numeric(summary(rls.means$mfrei)[1]), as.numeric(summary(rls.means$mfrei)[2]),as.numeric(summary(rls.means$mfrei)[4]), as.numeric(summary(rls.means$mfrei)[6])))
+
+
+############FINAL MODELLING##########################3
+get.results = function(m,x="super.density",wald=TRUE){
+  aic = AIC(m)
+  bic = BIC(m)
+  coeff = summary(m)$coefficients[x,1]
+  if (wald==TRUE){
+  ci = confint(m, method="Wald")
+  } else {
+  ci = confint(m)
+  }
+  low.ci = ci[x,1]
+  high.ci = ci[x,2]
+  results = c(coeff, low.ci, high.ci, aic, bic)
+  return(results)
+}
+
+final.models = function(ds = rls.means[rls.means$type==type,], xvar=c("super.density","mfrei"), type=c("fruit","vegetable")){
+#xvar="super.density"; ds = rls.means[rls.means$type=="fruit",]
+m1 = lm(as.formula(paste0("log(mean.real)", " ~ ", xvar, "+ year")), data = ds)  
+m2 = lm(as.formula(paste0("log(mean.real)", " ~ ", xvar, "+ year + month")), data = ds) 
+m3 = lm(as.formula(paste0("log(mean.real)", " ~ ", xvar, "+ year + month + bannerid")), data = ds) 
+m4 = lm(as.formula(paste0("log(mean.real)", " ~ ", xvar, "+ year + month + bannerid + quintmat + predict.pop + zone11")), data = ds) 
+fe.models.all = list(m1,m2,m3,m4)
+
+fe.models.crude = round(matrix(c(get.results(m1, x=xvar),get.results(m2, x=xvar),get.results(m3, x=xvar),get.results(m4, x=xvar)),ncol=5,byrow=TRUE),3)
+
+m1 = lmer(as.formula(paste0("log(mean.real)", " ~ ", xvar,"+ year + (1 | rls_code)")), data = ds)
+m2 = lmer(as.formula(paste0("log(mean.real)", " ~ ", xvar, " + year + month + (1 | rls_code)")), data = ds) 
+m3 = lmer(as.formula(paste0("log(mean.real)", " ~ ", xvar, " + year + month + bannerid + (1 | rls_code)")), data = ds) 
+m4 = lmer(as.formula(paste0("log(mean.real)", " ~ ", xvar, "+ year + month + bannerid + quintmat + predict.pop + zone11 + (1 | rls_code)")), data = ds) 
+re.models.all = list(m1,m2,m3,m4)
+
+re.models = round(matrix(c(get.results(m1, x=xvar),get.results(m2, x=xvar),get.results(m3, x=xvar),get.results(m4, x=xvar)),ncol=5,byrow=TRUE),3)
+
+
+#fe.models = data.frame(fe.models,se=rep("cluster.robust",nrow(fe.models)))
+fe.models.crude1 = data.frame(fe.models.crude,model_type=rep("ols", nrow(fe.models.crude)))
+re.models1 = data.frame(re.models,model_type=rep("random.effects",nrow(re.models))) 
+colnames(fe.models.crude1) = c("Beta", "low.ci","high.ci","AIC","BIC" , "model_type")
+colnames(re.models1) <- colnames(fe.models.crude1)
+all.results = data.frame(rbind(fe.models.crude1,re.models1))
+all.results$model.no = rep(1:4,2)
+
+bplot = ggplot(all.results) + geom_point(aes(model.no, Beta, color=model_type),size=3) +
+geom_errorbar(aes(x = model.no, ymin = low.ci, ymax = high.ci,color=model_type),width=0.2,size=2) + scale_x_continuous(breaks=c(1,2,3,4),labels=c(xvar, "+ month", "+ chain", "+ quintmat/pop")) + coord_flip() + geom_hline(yintercept=0) + scale_color_manual(name="Model",labels=c("ols", "random.effects (rls)"), values=values) + ggtitle(paste("Association between mean price & ",xvar , type, sep=" ")) + labs(y ="Mean Serving Price Change (Percentage Points)", x="Model") + theme(text = element_text(size=12))
+
+return(list(fe.models.all, re.models.all, all.results, bplot))
+
+}
+
+###################FRUITS###################
+fruit.density = final.models(ds = rls.means[rls.means$type=='fruit',], xvar="super.density", type='fruit')
+fruit.mfrei= final.models(ds = rls.means[rls.means$type=='fruit',], xvar="mfrei", type='fruit')
+f.best.model.density = fruit.density[[3]][fruit.density[[3]]$model_type=="random.effects" & fruit.density[[3]]$model.no==3 ,]
+f.best.model.mfrei =  fruit.mfrei[[3]][fruit.density[[3]]$model_type=="random.effects" & fruit.density[[3]]$model.no==3 ,]
+
+f.density.all.result = fruit.density[[3]][fruit.density[[3]]$model_type=="random.effects",]
+f.mfrei.all.result = fruit.mfrei[[3]][fruit.mfrei[[3]]$model_type=="random.effects",]
+
+f.density.result = paste(f.best.model.density$Beta," [",f.best.model.density$low.ci,";",f.best.model.density$high.ci,"]",sep="" )
+f.mfrei.result = paste(f.best.model.mfrei$Beta," [",f.best.model.mfrei$low.ci,";",f.best.model.mfrei$high.ci,"]",sep="" )
+
+best.fruit.model.density = fruit.density[[2]][[3]]
+# g.density.model.f <-  plot_model(best.fruit.model.density, type = "eff", show.ci = TRUE, terms= c("super.density"),
+#           axis.title=c("Supermarket Density per 1000 population","Log of Mean Serving Price"), title = "Predicted Mean Serving Price & Supermarket Density (Fruits)")
+
+best.fruit.model.mfrei = fruit.mfrei[[2]][[3]]
+# g.mfrei.model.v <- plot_model(best.fruit.model.mfrei, type = "eff", show.ci = TRUE, terms= c("mfrei"),
+#           axis.title=c("Modified Food Retail Environment Index (MfREI)","Log of Mean Serving Price"), title = "Predicted Mean Serving Price & MfREI (Fruits)")
+
+###################VEGETEABLES#############
+veg.density = final.models(ds = rls.means[rls.means$type=='vegetable',], xvar="super.density", type='vegetable')
+veg.mfrei= final.models(ds = rls.means[rls.means$type=='vegetable',], xvar="mfrei", type='vegetable')
+
+v.best.model.density= veg.density[[3]][veg.density[[3]]$model_type=="random.effects" & veg.density[[3]]$model.no==3 ,]
+v.best.model.mfrei =  veg.mfrei[[3]][veg.density[[3]]$model_type=="random.effects" & veg.density[[3]]$model.no==3 ,]
+
+v.density.all.result = veg.density[[3]][veg.density[[3]]$model_type=="random.effects",]
+v.mfrei.all.result = veg.mfrei[[3]][veg.mfrei[[3]]$model_type=="random.effects",]
+
+v.density.result = paste(v.best.model.density$Beta," [",v.best.model.density$low.ci,";",v.best.model.density$high.ci,"]",sep="" )
+v.mfrei.result = paste(v.best.model.mfrei$Beta," [",v.best.model.mfrei$low.ci,";",v.best.model.mfrei$high.ci,"]",sep="" )
+
+best.veg.model.density = veg.density[[2]][[3]]
+# g.mfrei.model.v <- plot_model(best.veg.model.mfrei, type = "eff", show.ci = TRUE, terms= c("mfrei"),
+#           axis.title=c("Modified Food Retail Environment Index (MfREI)","Log of Mean Serving Price"), title = "Predicted Mean Serving Price & MfREI (Vegetables)")
+
+best.veg.model.mfrei = veg.mfrei[[2]][[3]]
+# g.mfrei.model.v <- plot_model(best.veg.model.mfrei, type = "eff", show.ci = TRUE, terms= c("mfrei"),
+#           axis.title=c("Modified Food Retail Environment Index (MfREI)","Log of Mean Serving Price"), title = "Predicted Mean Serving Price & MfREI (Vegetables)")
+
+model.results = noquote(matrix(c(f.mfrei.result, v.mfrei.result, f.density.result, v.density.result), ncol=2, byrow=TRUE))
+rownames(model.results) <- c("MfREI","Supermarkets/1000"); colnames(model.results) <- labels
+####LOTS OF ALTERNATE SPECIFICATIONS#####
+##Using month as cubic doesn't matter
+# m3 = lmer(as.formula(paste0("log(mean.real)", " ~ super.density + year + bs(as.numeric(month),3) + bannerid + (1|rls_code)")), data = rls.means[rls.means$type=="fruit",]) 
+# summary(m3)
+# m3 = lmer(as.formula(paste0("log(mean.real)", " ~ mfrei + year + bs(as.numeric(month),3) + bannerid + (1|rls_code)")), data = rls.means[rls.means$type=="fruit",]) 
+# summary(m3)
+# ##Linear year term does matter - effect becomes stronger, but think its wrong
+# m3 = lmer(as.formula(paste0("log(mean.real)", " ~ super.density + as.numeric(year) + month + bannerid + (1|rls_code)")), data = rls.means[rls.means$type=="fruit",]) 
+# summary(m3)
+# m3 = lmer(as.formula(paste0("log(mean.real)", " ~ mfrei + as.numeric(year) + month + bannerid + (1|rls_code)")), data = rls.means[rls.means$type=="fruit",]) 
+# summary(m3)
+# ##Categorical variables - very small t-values
+# m3 = lmer(as.formula(paste0("log(mean.real)", " ~ mfrei.cat + year + month + bannerid + (1|rls_code)")), data = rls.means[rls.means$type=="fruit",]) 
+# summary(m3)
+# m3 = lmer(as.formula(paste0("log(mean.real)", " ~ super.cat + year + month + bannerid + (1|rls_code)")), data = rls.means[rls.means$type=="fruit",]) 
+# summary(m3)
+model.results.final <- model.results
+```
+
+A region with one additional supermarket per 1000 people had an average serving price that was `r round(v.density.all.result$Beta[v.density.all.result$model.no==3],2)`[95% CI: `r paste(round(v.density.all.result$low.ci[v.density.all.result$model.no==3],2),';',round(v.density.all.result$high.ci[v.density.all.result$model.no==3],2),sep="")`] percent higher vegetable products. In other words, for a region with mean serving price of 38 cents, adding a supermarket was associated with an averge increase to `r 38 * exp(round(v.density.all.result$Beta[v.density.all.result$model.no==3],2))`.  Conversely, we found that mean fruit prices decrease with higher MfREIs, such that a region with a mean of 38 cents per serving for fruits would decline to `r 38 * exp(round(f.mfrei.all.result$Beta[v.density.all.result$model.no==3],2))` with a unit increase in the proportion of healthy stores.  The effect estimates for the association of MfREI and vegetable prices, and supermarket density and fruit prices, were similarly negative in magnitude (Table 3). We did not see evidence of spatial autocorrelation in this model, suggesting the variables that we accounted for minimzed any residual correlation between the geographic location of the region and mean prices (Supplemental File 1 Figures 1,2).
+
+```{r regression_results}
+knitr::kable(model.results, caption="Table 3: Regression Model Results (with Random intercept for Region and Adjustment for Chain)")
+
+knitr::kable(f.density.all.result, caption="Table 1a: Fruit Prices and Supermarket Density: All Regression Results")
+knitr::kable(f.mfrei.all.result, caption="Table 1b: Fruit Prices and MfREI: All Regression Results")
+knitr::kable(v.density.all.result, caption="Table 2a: Vegetable Prices and Supermarket Density: All Regression Results")
+knitr::kable(v.mfrei.all.result,caption= "Table 2b: Vegetable Prices and MfREI: All Regression Results")
+```
+
+```{r plotspatialresiduals}
+rls.means.f.map <- rls.means %>% ungroup() %>% filter(type=="fruit") %>% mutate(density.residual = residuals(best.fruit.model.density),mfrei.residual = residuals(best.fruit.model.mfrei)) %>% select(rls_code, type, density.residual, mfrei.residual) %>% melt(id.vars=c('rls_code','type'))
+rls.means.v.map <- rls.means %>% ungroup() %>% filter(type=="vegetable") %>% mutate(density.residual = residuals(best.veg.model.density), mfrei.residual = residuals(best.veg.model.mfrei)) %>% select(rls_code, type, density.residual, mfrei.residual) %>% melt(id.vars=c('rls_code','type'))
+
+#acf(residuals(best.fruit.model.mfrei))
+#acf(residuals(best.veg.model.mfrei))
+
+##Plot residuals on the map
+rlscontour <- readOGR("Territoires_RLS_2014.shp")
+rlscontour@data$RLS_code <- as.character(rlscontour@data$RLS_code)
+#unique(all.drivers$rls_code %in% rlscontour@data$RLS_code)
+
+sum.all.rls = rls.means.f.map  %>% group_by(rls_code,variable) %>% summarise(residual=mean(as.numeric(value), na.rm=TRUE)) %>% ungroup()
+rlscontour$id = row.names(rlscontour)
+rlscontour_f <- fortify(rlscontour)
+rlscontour@data <- left_join(rlscontour@data, sum.all.rls, by=c('RLS_code'='rls_code'))
+rlscontour_f <- left_join(rlscontour_f, rlscontour@data)
+
+labels3 = c(density.residual="Supermarket Density",mfrei.residual="MfREI")
+g.regions.fruit = ggplot(data = rlscontour_f[rlscontour_f$lat < 500000 & rlscontour_f$long < 1000000 & rlscontour_f$long > 250000 , ] ) + geom_polygon(aes(long, lat, group=group, fill=residual), color='white') + coord_fixed() +
+scale_fill_distiller(name="Residual") + labs(title="Model Residuals (Supermarket density versus Fruit Affordability)",caption="Model was adjusted for month, year and chain, and included random intercepts for each region") # + facet_wrap(~variable, labeller=labeller(variable=labels3))
+
+tiff('paper1-figures/sa-figure1.tiff', units="in", width=8, height=5, res=300)
+gg.theme(g.regions.fruit) +  theme(axis.text = element_blank(), axis.title = element_blank(),axis.ticks = element_blank(),
+      plot.title = element_text(size=16,  family="CenturySch"),
+      panel.background = element_rect( colour = "black"),
+      panel.grid = element_blank())
+dev.off()
+
+rlscontour <- readOGR("Territoires_RLS_2014.shp")
+rlscontour@data$RLS_code <- as.character(rlscontour@data$RLS_code)
+#unique(all.drivers$rls_code %in% rlscontour@data$RLS_code)
+
+sum.all.rls = rls.means.v.map  %>% group_by(rls_code,variable) %>% summarise(residual=mean(as.numeric(value), na.rm=TRUE)) %>% ungroup()
+rlscontour$id = row.names(rlscontour)
+rlscontour_v <- fortify(rlscontour)
+rlscontour@data <- left_join(rlscontour@data, sum.all.rls, by=c('RLS_code'='rls_code'))
+rlscontour_v <- left_join(rlscontour_v, rlscontour@data)
+
+g.regions.veg = ggplot(data = rlscontour_v[rlscontour_v$lat < 500000 & rlscontour_v$long < 1000000 & rlscontour_v$long > 250000 , ] ) + geom_polygon(aes(long, lat, group=group, fill=residual), color='white') + coord_fixed() +
+scale_fill_distiller(name="Residual") + labs(title="Model Residuals (Supermarket density versus Vegetable Affordability)",caption="Model was adjusted for month, year and chain, and included random intercepts for each region")
+
+tiff('paper1-figures/sa-figure2.tiff', units="in", width=8, height=5, res=300)
+gg.theme(g.regions.veg) +  theme(axis.text = element_blank(), axis.title = element_blank(),axis.ticks = element_blank(),
+      plot.title = element_text(size=16,  family="CenturySch"),
+      panel.background = element_rect( colour = "black"),
+      panel.grid = element_blank())
+dev.off()
+```
+
+
+```{r ruralstratumplots}
+rls.means = rls.means %>% mutate(rural = zone11 > 3)
+
+labels2 =  c("TRUE"="Rural","FALSE"="Urban")
+g.mfrei = ggplot(rls.means  %>% group_by(rls_code,year,type,rural) %>% summarise(mean=mean(mean.real), mfrei = mean(mfrei)), aes(log(mfrei),mean,color=type)) + geom_point(alpha=0.6) + labs(title="Figure 3: Regional Mean Price vs Regional MfRei \n Stratified by rurality", x="Log of MfREi", y="Mean Price per Serving (cents)") + scale_color_manual(name="Type", labels=labels, values=values) + geom_smooth(aes(group=type), method="lm",size=1.5) + facet_wrap(~rural, labeller = labeller(rural=labels2))
+
+tiff("paper1-figures/figure3.tiff", units="in", height=5, width=8, res=300)
+gg.theme(g.mfrei)
+dev.off()
+
+g.density = ggplot(rls.means %>% group_by(rls_code,year,type,rural) %>% summarise(mean=mean(mean.real), density = mean(super.density)), aes(log(density),mean,color=type)) + geom_point(alpha=0.6) + labs(title="Figure 4: Regional Mean Price vs Regional Supermarket Density \n Stratified by rurality", x="Log of Density (Supermarkets per 1000 people)", y="Mean Price per Serving (cents)") + scale_color_manual(name="Type", labels=labels, values=values) + geom_smooth(aes(group=type), method="lm",size=1.5) + facet_wrap(~rural, labeller = labeller(rural=labels2))
+
+tiff("paper1-figures/figure4.tiff", units="in",height=5, width=8, res=300)
+gg.theme(g.density)
+dev.off()
+```
+
+```{r ruraldescriptives}
+rural.characs = rls.means %>% filter(year=='2009') %>% group_by(rural) %>% summarise(no.regions = n_distinct(rls_code), meanpop = mean(predict.pop), mean.pop.density = mean(pop.density), dep = mean(quintmat), chains = n_distinct(bannerid), meansupermarket =  mean(no_supermarket), super.density = mean(super.density), mfrei = mean(mfrei) ) %>% data.frame()
+
+```
+
+```{r ruralstratummodel}
+get.results = function(m,x="super.density",wald=TRUE){
+  aic = AIC(m)
+  bic = BIC(m)
+  coeff = summary(m)$coefficients[x,1]
+  if (wald==TRUE){
+  ci = confint(m, method="Wald")
+  } else {
+  ci = confint(m)
+  }
+  low.ci = ci[x,1]
+  high.ci = ci[x,2]
+  results = c(coeff, low.ci, high.ci)
+  return(results)
+}
+
+
+final.models.rural = function(ds, xvar=c("super.density","mfrei"), type=c("fruit","vegetable")){
+#xvar="super.density"; ds = rls.means[rls.means$type=="fruit",]
+m3 = lmer(as.formula(paste0("log(mean.real)", " ~ ", xvar, " + year + month + bannerid + (1 | rls_code)")), data = ds) 
+all.results <- get.results(m3,x=xvar)
+names(all.results) <- c("Beta", "low.ci", "high.ci")
+return(list(m3,all.results))
+}
+
+rural.result = function(b){
+result = paste(b['Beta']," [",b['low.ci'],";",b['high.ci'],"]",sep="" )
+return(result)
+}
+
+#####################Fruits##########################
+f.density.rural = round(final.models.rural(ds = rls.means[rls.means$rural=="TRUE" & rls.means$type=='fruit',], xvar="super.density", type="fruit")[[2]],2)
+f.density.urban = round(final.models.rural(ds = rls.means[rls.means$rural=="FALSE" & rls.means$type=='fruit',], xvar="super.density", type="fruit")[[2]],2)
+
+f.mfrei.rural = round(final.models.rural(ds = rls.means[rls.means$rural=="TRUE" & rls.means$type=='fruit',], xvar="mfrei", type="fruit")[[2]],2)
+f.mfrei.urban = round(final.models.rural(ds = rls.means[rls.means$rural=="FALSE" & rls.means$type=='fruit',], xvar="mfrei", type="fruit")[[2]],2)
+
+strata.results =  noquote(matrix(c(rural.result(round(f.mfrei.rural,2)),
+rural.result(round(f.mfrei.urban,2)),rural.result(round(f.density.rural,2)),
+rural.result(round(f.density.urban,2))),ncol=2,byrow=TRUE))
+
+rownames(strata.results) <- c("MfREI","Supermarkets/1000"); colnames(strata.results) <- c("Rural","Urban")
+strata.results.fruit <- strata.results  
+
+#####################VEGETABLE##########################
+v.density.rural = round(final.models.rural(ds = rls.means[rls.means$rural=="TRUE" & rls.means$type=='vegetable',], xvar="super.density", type="vegetable")[[2]],2)
+v.density.urban = round(final.models.rural(ds = rls.means[rls.means$rural=="FALSE" & rls.means$type=='vegetable',], xvar="super.density", type="vegetable")[[2]],2)
+
+v.mfrei.rural = round(final.models.rural(ds = rls.means[rls.means$rural=="TRUE" & rls.means$type=='vegetable',], xvar="mfrei", type="vegetable")[[2]],2)
+v.mfrei.urban = round(final.models.rural(ds = rls.means[rls.means$rural=="FALSE" & rls.means$type=='vegetable',], xvar="mfrei", type="vegetable")[[2]],2)
+
+strata.results = noquote(matrix(c(rural.result(round(v.mfrei.rural,2)),
+rural.result(round(v.mfrei.urban,2)),rural.result(round(v.density.rural,2)),
+rural.result(round(v.density.urban,2))),ncol=2,byrow=TRUE))
+
+rownames(strata.results) <- c("MfREI","Supermarkets/1000"); colnames(strata.results) <- c("Rural","Urban")
+strata.results.veg <- strata.results  
+
+#To Save
+save(rls.means, dmti.sum, model.results,dmti.overall, get.results,final.models.rural,rural.result, f.cluster.density, v.cluster.density, f.cluster.mfrei, v.cluster.mfrei, all.cluster,best.veg.model.density, best.veg.model.mfrei, best.fruit.model.mfrei, best.fruit.model.density, complete.rls.codes,gg.theme,file='paper1-data.RData')
+```
+
+Next, we stratified the data by regions' degree of rurality  In the rural category, there were `r  length(unique(rls.means$rls_code[rls.means$rural==TRUE]))` regions and in the urban category there were `r  length(unique(rls.means$rls_code[rls.means$rural==FALSE]))` regions. Rural and urban regions differed on a variety of other characteristics. Though the MfREI and supermarket density per 1000 people were similar, rural areas were on average more deprived, had fewer supermarket, lesser population and population density (Table 3). 
+
+```{r characs}
+knitr::kable(rural.characs, caption="Table 3: Rural Versus Urban Regions (Year 2009)")
+```
+
+The mean serving price for fruits in rural regions was `r  round(mean(rls.means$mean.real[rls.means$rural==TRUE & rls.means$type=="fruit"]),2)` (SD= `r  round(sd(rls.means$mean.real[rls.means$rural==TRUE & rls.means$type=="fruit"]),2)`) and for urban regions it was `r  round(mean(rls.means$mean.real[rls.means$rural==FALSE & rls.means$type=="fruit"]),2)` (SD=  `r  round(sd(rls.means$mean.real[rls.means$rural==FALSE & rls.means$type=="fruit"]),2)`).  The corresponding numbers for vegetables were `r  round(mean(rls.means$mean.real[rls.means$rural==TRUE & rls.means$type=="vegetable"]),2)` (SD= `r  round(sd(rls.means$mean.real[rls.means$rural==TRUE & rls.means$type=="vegetable"]),2)`) and `r  round(mean(rls.means$mean.real[rls.means$rural==FALSE & rls.means$type=="vegetable"]),2)` (SD= `r  round(sd(rls.means$mean.real[rls.means$rural==FALSE & rls.means$type=="vegetable"]),2)`). 
+
+The association between accessibility and affordability of fruits  were generally similar in the urban and rural stratum (Table 4).  There were bigger differences in the stratum for vegetable prices.  In rural regions, there was a positive change of `r strata.results.veg['MfREI','Rural']` percent in the average price when the proportion of healthy stores increased, while in urban regions, the change was negative (`r strata.results.veg['MfREI','Urban']`). While the rural and urban associations between supermarket density and mean price were both of positive magnitude, the effect was stronger in rural areas (Table 5).  
+
+```{r rural_model}
+knitr::kable(strata.results.veg, caption="Table 4: Stratified Regression Model Results (Vegetables)")
+knitr::kable(strata.results.fruit, caption="Table 5: Stratified Regression Model Results (Fruits)")
+
+```
+
+------------------
+
+
+```{r crude_rels}
+# g.no.supermarkets = ggplot(rls.means %>% group_by(rls_code,year,type) %>% summarise(mean=mean(mean.real), supermarket = mean(no_supermarket)), aes(mean,supermarket,color=year)) + 
+#   geom_point() + labs(title="Regional Mean Price vs No. Supermarkets")
+# 
+# g.mat.dep1 = ggplot(rls.means %>% group_by(rls_code) %>% summarise(mean=mean(quintmat), supermarket.density = mean(super.density)), 
+#        aes(mean,supermarket.density)) + geom_point(size=2) + labs(title="Material Deprivation Quintile vs Supermarket Density")
+# 
+# rls.means$mfrei.cat = cut(rls.means$mfrei,c(min(rls.means$mfrei),as.numeric(summary(rls.means$mfrei)[2]),as.numeric(summary(rls.means$mfrei)[4]),max(rls.means$mfrei)))g.mfrei.cat = ggplot(rls.means[!is.na(rls.means$mfrei.cat ),], aes(mfrei.cat,mean.real,color=type)) + geom_boxplot() + ggtitle("Mean Price by MfREi Category")
+
+```
