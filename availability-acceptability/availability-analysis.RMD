@@ -1,0 +1,612 @@
+---
+editor_options:
+  chunk_output_type: console
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = FALSE,warning=FALSE, message=FALSE)
+pacman::p_load(ggplot2,RPostgreSQL,cluster,splines,kml,longitudinalData,maps,mapdata,maptools,stringr,data.table,dplyr,reshape2,multiwayvcov,lmtest, rgdal, tmap, sjPlot, lme4,corrplot,tidyr)
+setwd('~/analysis_tmp/Nielsen')
+load('data-fsa.RData')
+load('paper3-data.RData')
+
+top.veg$bin = as.character(top.veg$bin); top.fruit$bin = as.character(top.fruit$bin)
+reps = c(rep("vegetable",nrow(top.veg)), rep("fruit",nrow(top.fruit)))
+std.basket = data.frame(bin=c(top.veg$bin,top.fruit$bin),type=reps)
+dat$year <- as.factor(dat$year)
+
+```
+
+```{r descriptives}
+no.chains = length(unique(dat$bannerid))
+no.stores.per.chain = dat %>% group_by(bannerid) %>% filter(bannerid != "347") %>% summarise(no_store = n_distinct(storeid))
+mean.store = round(mean(no.stores.per.chain$no_storestore),1); sd.store = round(sd(no.stores.per.chain$no_storestore),2)
+
+no.bins.chain <- bin_banners %>% group_by(bannerid) %>% summarise(no_bin = round(mean(no_bin),2))
+mean.bins <- round(mean(no.bins.chain$no_bin),2); 
+sd.bins <- round(sd(no.bins.chain$no_bin),2)
+no.bins.chain.store <- no.bins.chain %>% left_join(no.stores.per.chain)
+no.items.chain <- items_data %>% filter(year==2011) %>% group_by(bannerid) %>% summarise(item = n_distinct(items)) %>% summarise(mean_item=mean(item), sd_item = sd(item))
+no.items.store <- items_data %>% filter(year==2011) %>% group_by(storeid) %>% summarise(item = n_distinct(items)) %>% summarise(mean_item=mean(item), sd_item = sd(item))
+
+```
+
+Overall, there were `r no.chains` in the sample, which represented the major supermarket chains in Quebec.  On average there were `r mean.store`(SD=`r sd.store`) stores per chain, `r mean.bins`(SD=`r sd.bins`) per chain.  In 2011, there were a mean of `r round(no.items.chain$mean_item,2)`(SD = `r round(no.items.chain$sd_item,2)`) items per chain, and `r round(no.items.store$mean_item,2)`(SD=`r round(no.items.store$sd_item,2)`).
+
+##*Defining Availability*
+
+###Standard Basket
+Our standard basket included `r nrow(std.basket[std.basket$type=="vegetable",])` vegetable and `r nrow(std.basket[std.basket$type=="fruit",])` fruit categories which ranked in the top half for both sales dollars and volume. All vegetable and fruit categories in the NEMS-S were also identified by our procedure  
+
+```{r availability}
+##Availability indicator - NEMS-S
+nems.fruit = c("banana","apple","orange","grapes","cantaloupe","peach","strawberry","melon","watermelon","pear")
+nems.veg = c("carrot","tomato","pepper","broccoli","lettuce","corn","celery","cucumber","cabbage","cauliflower")
+nems.all = c(nems.fruit,nems.veg)
+
+##Cantaloupe and corn were not in my standard basket initially, but they were after I removed the store number > 90% restriction
+not.in.std.bskt = nems.all[which(!c(nems.all) %in% unique(dat$bin))]
+extra = unique(dat$bin[dat$bin %in% c(nems.fruit,nems.veg)])
+
+##Correct bin errors
+bin.data$bin[bin.data$bin=="apple "] <- "apple"
+
+bin.data.wide = bin.data %>% 
+  group_by(postalprefix,year,month,storeid,bannerid) %>%
+  distinct(bin) %>% mutate(include = 1) %>% spread(bin, include) %>% data.frame()
+bin.data.wide[is.na(bin.data.wide)] <- 0
+
+##Large standard basket
+bin.data.wide.r = bin.data.wide[,c( "bannerid", "storeid" ,"year" ,"month", "postalprefix",colnames(bin.data.wide)[colnames(bin.data.wide) %in% std.basket$bin])]
+
+sub.cols = bin.data.wide.r[,colnames(bin.data.wide)[colnames(bin.data.wide) %in% std.basket$bin]]
+sub.cols$no_available = rowSums(sub.cols)
+bin.data.wide.r$no_available = sub.cols$no_available
+bin.data.wide.r$available.all = ifelse(bin.data.wide.r$no_available==nrow(std.basket),1,0)
+bin.data.wide.r$p.available.all<- bin.data.wide.r$no_available/as.numeric(nrow(std.basket))
+
+##NEMS-S Standard Basket 
+bin.data.wide.nems = bin.data.wide[,c( "bannerid", "storeid" ,"year" ,"month", "postalprefix",colnames(bin.data.wide)[colnames(bin.data.wide) %in% nems.all])]
+
+sub.cols = bin.data.wide.nems[,colnames(bin.data.wide)[colnames(bin.data.wide) %in% nems.all]]
+sub.cols$no_available = rowSums(sub.cols)
+bin.data.wide.nems$no_available = sub.cols$no_available
+bin.data.wide.nems$available.nems = ifelse(bin.data.wide.nems$no_available==length(nems.all),1,0)
+bin.data.wide.nems$p.available.nems <- bin.data.wide.nems$no_available/as.numeric(length(nems.all))
+```
+
+##*Classifying Supermarkets*
+```{r chain_cat}
+##Regression approach
+chain.prices = dat %>% group_by(bannerid,storeid,year) %>% summarise(mean.real = weighted.mean(real.price,weight)) %>% as.data.frame()
+
+model.prices <- lm(log(mean.real) ~ bannerid + year, data = chain.prices)
+predictions <- as.data.frame(exp(predict(model.prices, data = chain.prices, type="response",interval="predict")))
+chain.prices <- cbind(chain.prices, predictions)
+
+chain.means = dat %>% group_by(bannerid,year) %>% summarise(mean.real = weighted.mean(real.price,weight)) %>% as.data.frame()
+
+##issue: price points different for fruits and vegetables - IGNORE FOR NOW
+# g = ggplot(chain.prices,aes(bannerid, mean.real, color=type)) + geom_boxplot(aes(bannerid, mean.real, color=type),alpha=0.1, size=0.5, position=position_dodge(1)) 
+# gg.theme(g) + labs(y = "Mean Price Per Serving (Fruits and Vegetables)", x = "Chain ID")
+
+
+##Factor approach
+
+# wide.chains <- reshape(chain.means %>% filter(!bannerid %in% c('9048','347','336')), idvar="year", timevar="bannerid", direction="wide")
+
+##Correlation in mean prices across years almost perfect
+# missing.chains <- c("347","9048","336")
+# cor(wide.chains %>% select(-year)) ##Suggests 248,286,306 = 0; 299,372,335=1; 315=2 - or with group 0
+# corrplot(cor(wide.chains %>% select(-year)), order = "hclust", tl.col='black', tl.cex=.75) 
+# 
+# factanal(wide.chains %>% select(-year), factors = 2, rotation = "varimax", na.action = na.omit) ##Error because high corr
+# 
+##Combine levels
+chain.means$level <- rep(NA,nrow(chain.means))
+chain.means$level[chain.means$bannerid %in% c("306","335")] <- 0
+chain.means$level[chain.means$bannerid %in% c("248","286","315")] <- 1
+chain.means$level[chain.means$bannerid %in% c("299","372","336","9048")] <- 2
+chain.means$level <- factor(chain.means$level, levels=c(0,1,2), labels=c('high','med','low'))
+##test for differences - all very different
+chain.model = lm(log(mean.real) ~ factor(level) + year, data = chain.means)
+chain.model.ci = exp(confint(chain.model))
+med = paste(round(exp(chain.model$coefficients['factor(level)med']),2),'(',toString(round(chain.model.ci['factor(level)med',],2)),')',sep="")
+low = paste(round(exp(chain.model$coefficients['factor(level)low']),2),'(',toString(round(chain.model.ci['factor(level)low',],2)),')',sep="")
+chain.model.matrix = matrix(c(1,med,low), nrow=3)
+rownames(chain.model.matrix) = c('High(Ref)','Medium','Low')
+colnames(chain.model.matrix) = c('Expected cents \n per serving (95% CI)')
+
+g.boxplot = ggplot(chain.means %>% filter(!bannerid %in% '347') %>% group_by(bannerid,level) %>% summarise(means= mean(mean.real)), aes(factor(level), means, group=level)) + geom_boxplot() + labs(x = "Chain Price Point",y="Mean Serving Price for Standard Basket" ,title="Mean Prices by Chain Price Point")
+
+##Add level to the data - EXCLUDE MISSING CHAINS FOR NOW
+chains = unique(chain.means$bannerid)
+chains <- as.data.frame(chains) %>% select(bannerid=chains)
+chains$level <- rep(NA,nrow(chains))
+chains$level[chains$bannerid %in% c("306","335")] <- 0
+chains$level[chains$bannerid %in% c("248","286","315")] <- 1
+chains$level[chains$bannerid %in% c("299","372","336","9048")] <- 2
+```
+
+We grouped the chains according to the mean price per serving for the fruit and vegetable standard basket.  After adjusting for years, these levels were found to be different in a linear regression model (Table 1), and through visual examination (Figure 2). The high, medium and low price level groups contained `r length(unique(chain.means$bannerid[which(chain.means$level=="high")]))`,`r length(unique(chain.means$bannerid[which(chain.means$level=="med")]))` and `r length(unique(chain.means$bannerid[which(chain.means$level=="low")]))` chains respectively.
+
+```{r chain_group_results}
+knitr::kable(chain.model.matrix, caption="Table 1: Chain Price Point vs. Mean Serving Price for Standard Basket)")
+
+tiff("paper3-figures/figure2.tiff", units="in", height=5, width=8, res=300)
+gg.theme(g.boxplot)
+dev.off()
+
+```
+
+```{r availability0}
+##Join chain price point data and census data ###JOIN AVAILABILITY DATA
+dat$month <- as.numeric(dat$month); 
+dat$year <- as.factor(dat$year); 
+bin.data.wide.nems$year <- as.factor(bin.data.wide.nems$year); 
+bin.data.wide.r$year <- as.factor(bin.data.wide.r$year)
+
+nems.bins = bin.data.wide.nems %>% select(year,month,postalprefix,bannerid,storeid,no_nems = no_available, p.available.nems, available.nems)
+std.bins = bin.data.wide.r %>% select(year,month,postalprefix,bannerid,storeid,no_all =no_available, p.available.all, available.all)
+dat.rt = dat %>% select(year, month, week, periodid, postalprefix, bannerid, storeid) %>% left_join(chains) %>% select(-week,-periodid) %>% distinct() %>% left_join(nems.bins) %>% left_join(std.bins) %>% filter(bannerid != '347' & year != "2008")
+
+nhs_2011 = nhs_2011 %>% rename(postalprefix = fsa)
+dat.rt <- dat.rt %>% left_join(nhs_2011)
+dat.rt$level <- factor(dat.rt$level, levels = c(0,1,2), labels = c('high','med','low'))
+```
+
+```{r explore_availability0}
+##Look at distribution of proportions within years - the distribution is highly left skewed, with a lot of data concentrated between 0.8 an 1
+
+##Dichotomize availability according to this distribution - SENSITIVITY ANALYSIS WITH DIFFERENT DICHOTOMIES
+p=0.86
+dat.rt$available.all.binary = ifelse(dat.rt$p.available.all <=p,0,1)
+dat.rt$available.nems.binary = ifelse(dat.rt$p.available.nems <=p,0,1)
+
+distribution.plot = ggplot(dat.rt) + geom_histogram(aes(p.available.all)) + geom_vline(xintercept=p) + labs(x = "Proportion of Standard Basket Items Available", y="Store-Months", title="Proportion of Standard Basket Items Available \n with cutoff") + geom_text(aes(x=0.83,y=1500,label="p=0.85"))
+
+##Sample sizes may be too low for fixed effects by year, could do continuous
+descriptives.raw.all = dat.rt %>% group_by(level) %>%  summarise(prop = mean(available.all.binary), store.months=n(), stores = n_distinct(storeid),  bins.all = round(mean(no_all),2),sd=round(sd(no_all),2)) %>% rename(Available=prop, Store.Months=store.months, Stores=stores, Bins=bins.all)
+
+descriptives.raw.nems = dat.rt %>% group_by(level) %>% summarise(prop=mean(available.nems.binary),store.months=n(), stores = n_distinct(storeid),  bins.nems =round(mean(no_nems),2), sd=round(sd(no_nems),2)) %>% select(Available=prop, Store.Months=store.months, Stores=stores, Bins=bins.nems)
+
+##Seasonal patterns same for high and medium, but lower for low chains - not a great plot because difference is actually really small
+g.seasonal = gg.theme(ggplot(dat.rt %>% group_by(month,level) %>% summarise(bin.mean = mean(p.available.all))) + stat_smooth(aes(month,bin.mean)) + facet_wrap(~level))
+
+##Desrciptives
+
+##Look further at the spike in low price point - bananas not available some palces in 2009??
+# low.price.point = dat.rt %>% filter(level=="low") %>% gather(bin, included, colnames(sub.cols)[colnames(sub.cols)!="no_available"])
+# ggplot(low.price.point %>% filter(bannerid != '336'),aes(bin,included,color=year)) + geom_point()
+# 
+# ##Look at bananas - same store driving no broccoli, tomato, celery, etc. - only 9 bins available
+# dat.rt[which(dat.rt$banana==0),] ##Only 1 month in 2009 suggesting scanner malfunction
+# dat.rt[which(dat.rt$pepper==0),] ##More reasonable - still all chain 336
+# dat.rt[which(dat.rt$grapes==0),] ##More reasonable - still all chain 336
+# dat.rt[which(dat.rt$peach==0),] ##OKAY
+# 
+# ##See what happened
+
+##Okay change looks real, but could still be due to lack of non-scanner products.
+```
+To define availability, we used 0.85 as the cut off to dichotomize availability based on the distribution of proportion of standard basket bins available.  The result was `r nrow(dat.rt[dat.rt$available.all.binary==0,])` store-months coded as 0, indicating lack of availability, and `r nrow(dat.rt[dat.rt$available.all.binary==1,])` store-months coded as 1.  Using the same criteria for the NEMS-S-developed standard basket, the numbers were `r nrow(dat.rt[dat.rt$available.nems.binary==0,])` and `r nrow(dat.rt[dat.rt$available.nems.binary==1,])`(Table 2).
+
+```{r descriptives_tables}
+tiff("paper3-figures/figure3.tiff", units="in", height=5, width=8, res=300)
+gg.theme(distribution.plot)
+dev.off()
+
+knitr::kable(descriptives.raw.all, caption="Table 2a: Availability of Standard Basket")
+knitr::kable(descriptives.raw.nems, caption="Table 2b: Availalbility of NEMS-S Std Basket")
+```
+
+#*Availability*
+```{r model_availability0}
+######USING FULL STANDARD BASKET
+dat.rt$year = factor(dat.rt$year)
+m1 = glmer(available.all.binary ~ level + year + (1|storeid), data = dat.rt, family=binomial(link="logit") )
+
+# m1 = glm(available.all.binary ~ level , data = dat.rt, family=binomial(link="logit") )
+get.results = function(m,x,wald=TRUE){
+  coeff = exp(summary(m)$coefficients[x,1])
+  if (wald==TRUE){
+  ci = exp(confint(m, method="Wald"))
+  } else {
+  ci = exp(confint(m))
+  }
+  low.ci = ci[x,1]
+  high.ci = ci[x,2]
+  results = matrix(c(coeff, low.ci, high.ci),nrow=length(x))
+  colnames(results) <- c("OR", "low.ci", "high.ci")
+  return(results)
+}
+dat.rt$predict_all=predict(m1,type="response")
+r = get.results(m=m1, x=c("levelmed","levellow"), wald=TRUE)
+r = as.array(r)
+r = as.data.frame(r)
+r <- round(r,2)
+r.all <- r
+
+##Average risk in the high group = 0.92
+avg.risk=mean(dat.rt$p.available.all[dat.rt$level=="high"])
+rr = round(r.all/((1-avg.risk) + (avg.risk*r.all)),2)
+high.p = mean(dat.rt$predict_all[dat.rt$level=="high"]); 
+med.p = mean(dat.rt$predict_all[dat.rt$level=="med"]); 
+low.p = mean(dat.rt$predict_all[dat.rt$level=="low"])
+rd01 = high.p-med.p; rd02 = high.p-low.p
+r.all$rd= round(rbind(rd01, rd02 ),2)
+r.all$abs = round(r.all$rd*length(std.basket$bin),2) 
+
+##Format Table
+input = function(r.all=r.all,rr=rr){
+or = paste(r.all$OR[1],'(',r.all$low.ci[1],';',r.all$high.ci[1],')',sep="")
+rr.x = paste(rr$OR[1],'(',rr$low.ci[1],';',rr$high.ci[1],')',sep="")
+rd = paste(r.all$rd[1])
+abs = paste(r.all$abs[1])
+or1 = paste(r.all$OR[2],'(',r.all$low.ci[2],';',r.all$high.ci[2],')',sep="")
+rr1.x = paste(rr$OR[2],'(',rr$low.ci[2],';',rr$high.ci[2],')',sep="")
+rd1 = paste(r.all$rd[2])
+abs1 = paste(r.all$abs[2])
+r.all.final = matrix(c(or,rr.x,rd,abs,or1,rr1.x,rd1,abs1),nrow=2,byrow=TRUE)
+colnames(r.all.final) = c('OR','RR','RD','Absolute Difference')
+rownames(r.all.final) = c('Medium','Low')
+return(r.all.final)
+}
+
+final.all = noquote(input(r.all,rr=rr))
+
+##Note GLM and LM give the same predicted probabilities almost the same - use glmer
+#x = lmer(available.all.binary ~ level  + year + (1|storeid), data = dat.rt) 
+#dat.rt$predict1 = predict(x,type="response")
+# g.pp = ggplot(dat.rt %>% group_by(level,year) %>% summarise(p = mean(predict1), p2 = mean(predict2))) + geom_point(aes(group=level,color=level,x = year, y=p)) + geom_line(aes(group=level,color=level,x = year, y=p)) + geom_line(aes(group=level,color=level,x = year, y=p2), size=2) 
+
+
+######USING NEMS-S STANDARD BASKET
+m2 = glmer(available.nems.binary ~ level + year + (1|storeid), data = dat.rt, family=binomial(link="logit") )
+
+r = get.results(m=m2, x=c("levelmed","levellow"), wald=TRUE)
+r = as.array(r)
+r = as.data.frame(r)
+r.nems <- round(r,2)
+
+##Average risk in the high group = 0.96
+dat.rt$predict_nems = predict(m2,type="response")
+avg.risk=mean(dat.rt$p.available.nems[dat.rt$level=="high"])
+rr = round(r.nems/((1-avg.risk) + (avg.risk*r.nems)),2)
+high.p = mean(dat.rt$predict_nems[dat.rt$level=="high"])
+med.p = mean(dat.rt$predict_nems[dat.rt$level=="med"])
+low.p = mean(dat.rt$predict_nems[dat.rt$level=="low"])
+rd01 = high.p-med.p; rd02 = high.p-low.p
+r.nems$rd= round(rbind(rd01, rd02 ),2)
+r.nems$abs = round(r.nems$rd*length(nems.all),2) 
+
+final.nems = noquote(input(r.nems,rr=rr))
+
+
+##Plots
+dat.rt$predict_all = predict(m1,type="response")
+
+all.plot = plot_model(m1, type = "eff", show.ci = TRUE, terms="level") 
+gg.theme(all.plot + labs(x="Chain Price Point",y="Marginal Probability of \n Standard Basket being Available", caption="Probabilities obtained through mixed effects logistic regression model adjusted for year and season, with random intercepts for store", title="Marginal Probability of \n Large Standard Basket Availability"))
+
+g.pp.final.by.year = ggplot(dat.rt %>% group_by(level,year) %>% summarise(p2 = mean(predict_all))) + geom_point(aes(group=level,color=level,x = year, y=p2),size=2) + geom_line(aes(group=level,color=level,x = year, y=p2), size=2) + labs(y="Mean Predicted Probability") + scale_color_discrete(name="Chain Price Point")
+
+g.pp.final.by.year2 = ggplot(dat.rt %>% group_by(level,year) %>% summarise(p2 = mean(predict_nems))) + geom_point(aes(group=level,color=level,x = year, y=p2),size=2) + geom_line(aes(group=level,color=level,x = year, y=p2), size=2) +
+  labs(y="Mean Predicted Probability", x="Year", title = "")
+gg.theme(g.pp.final.by.year2)
+
+nems.plot = plot_model(m2, type = "eff", show.ci = TRUE, terms="level") 
+gg.theme(nems.plot + labs(x="Chain Price Point",y="Marginal Probability of \n Standard Basket being Available", caption="Probabilities obtained through mixed effects logistic regression model adjusted for year and season, with random intercepts for store", title="Marginal Probability of \n NEMS-S Standard Basket Availability"))
+
+```
+
+We found that lower price point chains have lower availability of both the NEMS-S's and our larger standard basket (Tables 3 and 4).  While the relative measures suggest apparently large differences (e.g. RR for high vs low for large standard basket= `r final.all[1,'RR']`, the absolute differences are not as striking.  For the largest risk ratio, which was comparing the high versus low price point chains for the large standard basket, the measure only amounted to an absolute difference in number of bins of `r final.all[1,'Absolute Difference']`.  The average yearly predicted probabilities demonstrate a time trend in availability, where the differences are much larger before 2011 and shrink due to increased availability at low price point chains by 2013 (Figure 4). 
+
+We did not proceed further with analysis of the availability indicator as a result of the similarity across chain price points.
+
+```{r availability_results}
+knitr::kable(final.all, caption="Results for Availability of Larger Standard Basket")
+knitr::kable(final.nems, caption="Results for Availability of NEMS-S Standard Basket")
+
+tiff("paper3-figures/figure4.tiff", units="in", height=5, width=8, res=300)
+gg.theme(g.pp.final.by.year)
+dev.off()
+
+```
+
+#*Acceptability*
+```{r acceptability}
+##Look at variation across chains and region - not enough variation in the standard basket
+g.variation = ggplot(dat.rt %>% group_by(postalprefix) %>% summarise(p = mean(p.available.all))) + geom_histogram(aes(p))
+
+##Look at full data & Join to Census - Also join levels
+levels = dat.rt %>% select(bannerid,level) %>% distinct()
+all.bins = items_data %>% left_join(nhs_2011)
+all.bins = all.bins %>% left_join(levels)
+
+##Look at differences by fsa - there may be enough chain differences in bins, and definitely items by FSA
+
+##Nice normal distribution over FSA
+g.normal = ggplot(all.bins %>% group_by(postalprefix,storeid) %>% summarise(x = n_distinct(items)) %>% summarise(x = mean(x))) + geom_histogram(aes(x))
+
+##Outlier is 70,000 - J8T
+# all.bins %>% group_by(postalprefix) %>% summarise(x = sum(items)) %>% filter(x > 70000)
+# all.bins %>% filter(postalprefix=="J8T") %>% distinct(bannerid) ##Has 5 banner ids
+# all.bins %>% filter(postalprefix=="J8T") %>% distinct(storeid) ##Has six stores
+# all.bins %>% group_by(postalprefix) %>% summarise(x = n_distinct(bannerid)) %>% summarise(mean(x))  ##Avg is only 1.4
+# all.bins %>% group_by(postalprefix) %>% summarise(x = n_distinct(bannerid)) %>% arrange(-x) ##Max is J8T
+####TRY ANALYSIS WITH AND WITHOUT J8T, but no TRUE reason to remove
+
+##Set up Data - group to number of distinct items
+item.a = all.bins %>% group_by(postalprefix,bannerid,year,month,level,income= median_family_income_2011_cs,educ=post_secondary_2011_cs) %>% summarise(item.m = n_distinct(items)) %>% filter(postalprefix != "J8T") %>% data.frame()
+item.a$income = as.numeric(item.a$income)
+
+##Look at bivariate assocations
+g.bivariate = ggplot(item.a %>% group_by(postalprefix,bannerid) %>% summarise(item.m=mean(item.m),income=mean(income)), aes(log(income),item.m)) + stat_smooth(method="lm", se=FALSE) + geom_point(alpha=0.2) +  facet_wrap(~bannerid) 
+
+###No interaction or, but potentially more availability in the winter... 
+# ggplot(item.a  %>% group_by(postalprefix,month) %>% summarise(item.m=mean(item.m),income=mean(income)), aes(factor(month),item.m, color=postalprefix, group=postalprefix)) + geom_point() + geom_line() + scale_color_discrete(guide=FALSE)
+# ggplot(item.a  %>% group_by(postalprefix,month) %>% summarise(item.m=mean(item.m),income=mean(income)), aes(log(income),item.m)) + stat_smooth(method="lm", se=FALSE) + geom_point(alpha=0.2) +  facet_wrap(~month) 
+
+###Increase over time, but not extreme 
+g.time=ggplot(item.a  %>% group_by(postalprefix,year) %>% summarise(item.m=mean(item.m),income=mean(income)), aes(factor(year),item.m, color=postalprefix, group=postalprefix)) + geom_point() + geom_line() + scale_color_discrete(guide=FALSE)
+
+###May be interaction with chain
+g.chain.interaction=ggplot(item.a %>% group_by(postalprefix,bannerid) %>% summarise(item.m=mean(item.m),income=mean(income)), aes(log(income),item.m)) + stat_smooth(method="lm", se=FALSE) + geom_point(alpha=0.2) +  facet_wrap(~bannerid) 
+
+###Look at association with level
+##No interaction or apparent association
+g.level=gg.theme(ggplot(item.a %>%  group_by(postalprefix,level) %>% summarise(item.m=mean(item.m),income=mean(income)), aes(log(income),item.m)) + stat_smooth(method="lm", se=FALSE) + geom_point(alpha=0.2) + facet_wrap(~level))
+#ggplot(item.a, aes(level,item.m)) + geom_boxplot()
+
+##Recode income variable - 2011 low income cut-off in Quebec = $40,000 - CAN'T NO REGIONS 
+item.a$income_cut = factor(ifelse(item.a$income <= 70000,1,0), levels=c(0,1), labels=c("high.income", "low.income"))
+#item.a %>% group_by(income_cut) %>% summarise(n_distinct(postalprefix))
+
+descriptives.accept = item.a %>% group_by(income_cut) %>% summarise(mean.income = mean(income),sd.income = sd(income), mean.items = mean(item.m), sd.items = sd(item.m), mean.educ = mean(educ), sd.educ = sd(educ), no.regions = n_distinct(postalprefix))
+
+descriptives.raw.items = all.bins %>% group_by(level,year) %>%  summarise(items.all = n_distinct(items)) %>% summarise(mean.items = mean(items.all))
+```
+The high, medium and low level price points offered an average of `r descriptives.raw.items %>% filter(level=="high") %>% select(mean.items) %>% as.numeric()`,`r descriptives.raw.items %>% filter(level=="med") %>% select(mean.items) %>% as.numeric()` and `r descriptives.raw.items %>% filter(level=="low") %>% select(mean.items) %>% as.numeric()` unique items per year, respectively.  There were `r descriptives.accept$no.regions[1]` regions in the higher income regions and `r descriptives.accept$no.regions[2]` in the lower income regions.  On average, there was a `r descriptives.accept$mean.income[1] - descriptives.accept$mean.income[2]` income difference between the two groups (Table 5).
+
+```{r acceptability_descriptives}
+knitr::kable(descriptives.accept, caption="Table 5: Acceptability Sample Characteristics")
+
+```
+
+```{r availability2}
+####POTENTIALLY ADD EDUCATION
+item.a$bannerid = factor(item.a$bannerid)
+
+#Create month-year index
+# my = item.a %>% select(month,year) %>% distinct() %>% arrange(year,month)
+# my$my = paste0(my$month,'.',my$year)
+# item.a = left_join(item.a,my)
+
+m4 <- lm(item.m ~ level*income_cut + educ + year + bs(month,4), data = item.a)
+# vcov1 <- cluster.vcov(m4,item.a$my)
+# new.se1 = coeftest(m4, vcov1)
+# new.se1
+##Effect dissapears if you adjust for banner - ASSUME ALL BANNERS ARE PRESENT IN ALL REGIONS?
+m5 <- lm(item.m ~ income_cut*bannerid + educ + year + bs(month,4), data = item.a)
+# item.a$my = factor(item.a$my)
+# summary(m5)
+# vcov1 <- cluster.vcov(m5,item.a$my)
+# new.se1 = coeftest(m5, vcov1)
+# new.se1
+#m6 <- lm(item.m ~ educ*bannerid + educ + year + bs(month,4), data = item.a)
+item.a$predict_level = predict(m4,newdata = item.a, type="response")
+item.a$predict_income = predict(m5,newdata = item.a, type="response")
+#item.a$prediction3 = predict(m6, newdata = item.a, type="response")
+
+##Final Results
+level.model.ci =confint(m4)
+coeffs = c('levelmed','levellow','income_cutlow.income','levelmed:income_cutlow.income','levellow:income_cutlow.income','educ')
+results = paste(round(m4$coefficients[coeffs],2),'(',round(level.model.ci [coeffs,1],2),',',round(level.model.ci [coeffs,2],2),')',sep="")
+all.results.levels = noquote(matrix(c(1,results[1:2],1,results[3],1,results[4:6]),byrow=TRUE,ncol=1))
+colnames(all.results.levels) = c("Expected Difference in Items Sold")
+rownames(all.results.levels) = c("ref:levelhigh",coeffs[1:2], "ref:high.income", coeffs[3], "ref:levelhigh:highincome",coeffs[4:6])
+
+##plots
+g.model <- gg.theme(ggplot(item.a %>% group_by(year,bannerid,income_cut) %>% summarise(predict.mean = mean(predict_income), obs.mean = mean(item.m))) + geom_line(aes(year,predict.mean,group=income_cut, color=income_cut), size=2) + facet_wrap(~bannerid) + labs(x = "Year", y="Mean Predicted Number Fruit and Vegetable Items", title = "Estimated Number of Items by Regional Income", caption="Predictions derived through linear model adjusted for year and month, with an income-chain interaction") ) + 
+geom_line(aes(year,obs.mean,group=income_cut, color=income_cut), size=1, alpha=0.4)
+g.model 
+
+g.acceptability = gg.theme(ggplot(item.a %>% group_by(year,level,income_cut) %>% summarise(predict.mean = mean(predict_level))) + geom_line(aes(year,predict.mean,group=income_cut, color=income_cut), size=2) + facet_wrap(~level) + labs(x = "Year", y="Mean Predicted Number Fruit and Vegetable Items", title = "Estimated Number of Items by Regional Income", caption="Predictions derived through linear model adjusted for year and month, with an income-chain interaction") )
+
+gg.theme(ggplot(item.a %>% group_by(year,level,income_cut) %>% summarise(predict.mean = mean(predict_income), obs.mean = mean(item.m))) + geom_line(aes(year,predict.mean,group=level, color=level), size=2) + 
+geom_line(aes(year,obs.mean,group=level, color=level), size=2, alpha=0.2) +
+facet_wrap(~income_cut) + labs(x = "Year", y="Mean Predicted Number Fruit and Vegetable Items", title = "Estimated Number of Items by Regional Income", caption="Predictions derived through linear model adjusted for year and month, with an income-chain interaction") )
+
+```
+
+After adjusting for chain price point, we found the primary association between income and number of available items decreased in magnitude, however there were  differences across price points (Figure XX).  The differences were highest in magnitude for high-price point chains, such that higher income areas had more item variety on average than lower income areas. Medium price point chains offered `r round(summary(m4)$coefficients['levelmed:income_cutlow.income',1],2)`(95% CI `r round(summary(m4)$coefficients['levelmed:income_cutlow.income',1]+c(-1,1)*summary(m4)$coefficients['levelmed:income_cutlow.income',2],2)`) more items on average relative to high price chains in lower income areas. (Table 6)
+
+When we modelled chain directly instead of chain price point, we found that one banner had  `r round(summary(m5)$coefficients['income_cutlow.income:bannerid336',1],2)`(95% CI `r round(summary(m5)$coefficients['income_cutlow.income:bannerid336',1]+c(-1,1)*summary(m5)$coefficients['income_cutlow.income:bannerid336',2],2)`) more items on average relative to a reference chain in lower income areas. Though smaller for other chains, the findings were consistently negative, meaning less variety was offered within lower income areas within chains (Table XXX).
+
+```{r acceptability_results}
+knitr::kable(all.results.levels, caption="Table 7: Model Results for Acceptability")
+
+tiff("paper3-figures/figure5.tiff", units="in", height=5, width=8, res=300)
+g.acceptability
+dev.off
+
+```
+--------
+```{r predict_availability}
+
+
+```
+
+```{r models}
+# #Candidate models and error 
+# m1 = lm(bins ~ bannerid , data = ds)
+# m2 = lm(bins ~ bannerid + bs(month, degree=3)  , data = ds)
+# m3 = lm(bins ~ bannerid + bs(month, degree=3) + fsa , data = ds)
+# m4 = lm(bins ~ bannerid + bs(month, degree=3) + fsa + income..., data = ds)
+# 
+# mat1 = matrix(,4,4,); colnames(mat1) = c("Adj-R2", "SSE", "AIC", "Deviance")
+# mat1[1,] = c(summary(m1)$adj.r.squared,sum(m1$residuals^2), AIC(m1), deviance(m1))
+# mat1[2,] = c(summary(m2)$adj.r.squared,sum(m2$residuals^2), AIC(m2), deviance(m2))
+# mat1[3,] = c(summary(m3)$adj.r.squared,sum(m3$residuals^2), AIC(m3), deviance(m3))
+# mat1[4,] = c(summary(m4)$adj.r.squared,sum(m4$residuals^2), AIC(m4), deviance(m4))
+# 
+# mat1
+
+```
+
+
+
+```{r model_set_1_plots}
+# ds$prediction1 = predict(m1, data = ds, type="response")
+# ds$prediction2 = predict(m2, data = ds, type="response")
+# ds$prediction3 = predict(m3, data = ds, type="response")
+# ds$prediction4 = predict(m4, data = ds, type="response")
+# x = "Observed Availability"; y = "Predicted Availability"
+# 
+# p1 = ggplot(ds, aes(avg, prediction1)) + geom_point() +
+# labs(x=x,y=y,title="Model 1") 
+# 
+# p2 = ggplot(ds, aes(avg, prediction2)) + geom_point()  +
+# labs(x=x,y=y,title="Model 2")
+# 
+# p3 = ggplot(ds, aes(avg, prediction3)) + geom_point() +
+# labs(x=x,y=y,title="Model 3")
+# 
+# p4 = ggplot(ds, aes(avg, prediction4)) + geom_point()  +
+# labs(x=x,y=y,title="Model 4")
+# 
+# grid.arrange(p1,p2,p3,p4,ncol=2)
+```
+
+
+```{r testdata}
+# m1 = lm(bins ~ bannerid , data = ds)
+# m2 = lm(bins ~ bannerid + bs(month, degree=3)  , data = ds)
+# m3 = lm(bins ~ bannerid + bs(month, degree=3) + fsa , data = ds)
+# m4 = lm(bins ~ bannerid + bs(month, degree=3) + fsa + income..., data = ds)
+# 
+# diagnose = data.frame(fitted = fitted.values(m4), residuals = residuals(m4))
+# ggplot(diagnose, aes(fitted,residuals)) +  geom_point() +
+#   labs(x="Fitted Values", y="Residuals", title = "Residuals Plot for Final Model using Test Data")
+# 
+# mat1 = matrix(,4,4,); colnames(mat1) = c("Adj-R2", "SSE", "AIC", "Deviance")
+# mat1[1,] = c(summary(m1)$adj.r.squared,sum(m1$residuals^2), AIC(m1), deviance(m1))
+# mat1[2,] = c(summary(m2)$adj.r.squared,sum(m2$residuals^2), AIC(m2), deviance(m2))
+# mat1[3,] = c(summary(m3)$adj.r.squared,sum(m3$residuals^2), AIC(m3), deviance(m3))
+# mat1[4,] = c(summary(m4)$adj.r.squared,sum(m4$residuals^2), AIC(m4), deviance(m4))
+# 
+# mat1
+```
+
+```{r junk}
+##Regression model 1 - ACCEPTABILITY
+# hist(dat.rt$no_bin) ##Highly normal
+# head(dat.rt)
+# m1 <- lm(no_bin ~ level, data = dat.rt)
+# plot(residuals(m1)) ##Missing monthly/seasonal/yearly pattern
+# summary(m1)
+# 
+# m2 <- lm(no_bin ~ level + month + year, data = dat.rt)  
+# plot(residuals(m2)) 
+# qqnorm(y=residuals(m2))
+# qqline(y=residuals(m2)) ##Very good model - lightly tailed
+# summary(m2)
+# 
+# dat.rt$year2 <- as.numeric(dat.rt$year)
+# m3 <- lm(no_bin ~ level*year2 + month , data = dat.rt)  
+# plot(residuals(m3)) 
+# qqnorm(y=residuals(m3))
+# qqline(y=residuals(m3)) ##Very good model - lightly tailed
+# summary(m3)
+# 
+# m4 <- lm(no_bin ~ level*year + bs(month,4) , data = dat.rt)  
+# plot(residuals(m4)) 
+# qqnorm(y=residuals(m4))
+# qqline(y=residuals(m4)) ##Very good model - lightly tailed
+# summary(m4)
+
+#m4 <- lm(no_bin ~ level*year + bs(month,4) , data = dat.rt)  
+# qqnorm(y=residuals(m4))
+
+##Clean up data to match banner ID
+# supermarkets = dmti %>% filter(supermarket==TRUE | supercentre==TRUE) %>% ungroup() %>% select(poi_id, name=store, year, postalprefix=fsa)
+# ##Combine IGA, IGA Extra, Metro, Metro Plus, Richelieu and Metro
+# supermarkets[which(supermarkets$name=="IGA EXTRA"),'name'] <- "IGA"
+# supermarkets[which(supermarkets$name %in% c("METRO PLUS","RICHELIEU")),'name'] <- "METRO"
+# 
+# all_supermarkets = supermarkets  %>% select(name) %>% distinct()
+# banner_key = banner_map %>% select(name=bannername_corrected2, bannerid) %>% filter(name %in% all_supermarkets$name | name=="MAXICIE")
+# 
+# ##Nielsen items
+# nielsen.items = all.bins %>% group_by(storeid,bannerid,month,year,postalprefix,median_family_income_2011_cs,prop_immig,post_secondary_2011_cs) %>% summarise(n_items = n_distinct(items), n_bins = n_distinct(bin)) %>% data.frame()
+# 
+# ##Standard basket
+# nielsen.std.basket = dat.rt  %>% group_by(storeid,bannerid,month,year,postalprefix,median_family_income_2011_cs,prop_immig,post_secondary_2011_cs) %>% summarise(no_nems = mean(no_nems), no_all = mean(no_all)) %>% data.frame()
+# head(nielsen.std.basket)
+# 
+# ##Join dmti and banner map - no ID mainly for AXEP, COSTCO AND BONI-CHOIX (MIGHT BE INTERMARCHE)
+# dmti.bannerid = supermarkets  %>% full_join(banner_key)
+# dmti.bannerid[dmti.bannerid$postalprefix=="G1K",]
+# supermarkets[supermarkets$poi_id=="POI4271669",]
+# 
+# missing.bannerid = table(dmti.bannerid[is.na(dmti.bannerid$bannerid),'name'])
+# dmti.bannerid = dmti.bannerid[!is.na(dmti.bannerid$bannerid),]
+# 
+# ##Expand grid to include month
+# nrow(distinct(dmti.bannerid)); nrow(dmti.bannerid)
+# dmti.bannerid.expand = merge(dmti.bannerid, data.frame(month=seq(1,12,by=1)), by=NULL)
+# ##SHould have 12 times the rows
+# nrow(dmti.bannerid.expand)==nrow(dmti.bannerid)*12
+# 
+# ##Join to Nielsen Data - AUTOMATICALLY MATCHES STORE WITH MATCHING FSA/CHAIN/ETC TO DMTI - NEED TO START WITH DISTINCT PATTERNS
+# ##Match 1 name-year-postalprefix-bannerid combination to each one in DMTI
+# #1. Restrict to 1 year
+# unique.nielsen = nielsen.items %>% select(year,postalprefix,bannerid,storeid) %>% filter(year=="2009") %>% distinct()
+# 
+# #2. check if any poi_id assigned to more than 1 store id
+# matches  = dmti.bannerid.expand %>% select(poi_id,year,postalprefix,bannerid,name) %>% filter(year==2009)  %>% distinct()
+# nielsen.match = left_join(unique.nielsen, matches)
+# multiple.poi.id = nielsen.match  %>% group_by(poi_id) %>% summarise(x=n_distinct(storeid)) %>% filter(x != 1)
+# 
+# nrow(nielsen.match[is.na(nielsen.match$poi_id) & nielsen.match$bannerid != 372,]) ##38 stores not matched out of 149
+# length(unique(nielsen.items$storeid[nielsen.items$year==2009]))==length(unique(nielsen.match$storeid))
+# 
+# #3. See Why - because there are 2 stores with same bannerid in same area in same year in one of the FSAs - can assign manually
+# multiples = nielsen.match %>% filter(poi_id %in% multiple.poi.id$poi_id)
+# ####Solution: Assign 1st poi_id 2 of these IDs to match up, and leave out the first store for now
+# store.assign = nielsen.match %>% filter(poi_id %in% multiple.poi.id$poi_id[1:3]) %>% 
+#   group_by(year,postalprefix,storeid) %>% 
+#   summarise(poi_id=first(poi_id), name=first(name))
+# 
+# #4. Stores with missing data
+# nielsen.match[nielsen.match$storeid %in% store.assign$storeid,] <- store.assign
+# no.multiples = nielsen.match  %>% group_by(poi_id) %>% summarise(x=n_distinct(storeid)) %>% filter(x != 1)
+# 
+# #5.Assign banner 372 to MAXI
+# nielsen.match[nielsen.match$bannerid==372,'name'] <- "MAXI"
+# 
+# #BRING IN ANY UNMATCHED MAXI - added 10/12
+# missing.maxi = nielsen.match[nielsen.match$bannerid==372,]
+# 
+# add.maxi = dmti.bannerid.expand[!(dmti.bannerid.expand$poi_id %in% nielsen.match$poi_id) & dmti.bannerid.expand$name=="MAXI" ,] %>% select(poi_id,postalprefix) %>% left_join(missing.maxi, by=c('postalprefix'='postalprefix')) %>% filter(!is.na(year)) %>% arrange(storeid) %>% group_by(year,postalprefix,storeid,bannerid) %>% summarise(poi_id=first(poi_id.x), name=first(name))
+# 
+# nielsen.match[nielsen.match$bannerid==372 & nielsen.match$storeid %in% add.maxi$storeid,] <- add.maxi
+# 
+# ##Mark Nielsen Id'd stores
+# nielsen.match$match=rep(1,nrow(nielsen.match))
+# dmti.bannerid.expand$match=ifelse(dmti.bannerid.expand$poi_id %in% nielsen.match$poi_id, 1, 0)
+# 
+# ##Join only unmatched stores to fill in - THINK HOW TO DO THIS - MAY NOT EVEN NEED TO JOIN
+# unmatched = dmti.bannerid.expand %>% data.frame() %>% filter(match==0) 
+# nielsen.match = merge(nielsen.match, data.frame(month=seq(1,12,by=1), by=NULL))
+# head(nielsen.match)
+# test = nielsen.items %>% left_join(unmatched) 
+# nielsen.items %>% left_join(nielsen.match) %>% arrange(month)
+
+```
+
+
