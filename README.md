@@ -1,4 +1,4 @@
-# Food prices
+# Investigating food environment disparities using digital supermarket transactions for fruits and vegetables in Quebec
 
 This repository contains code for three papers published as part of a PhD Dissertation. The papers include:
 1.Jahagirdar, D; Quesnel-Vallée, A, Ma, Y, Buckeridge, D. (2018) The dynamic between affordability and accessibility of healthy food. 
