@@ -1,36 +1,29 @@
-library("ggplot2")
-library("RPostgreSQL")
-library("cluster")
-library("splines")
-library('kml')
-library("longitudinalData")
-library('maps')
-library('mapdata')
-library('maptools') 
-library('stringr')
-library('data.table')
-library('dplyr')
 
-drv <- dbDriver("PostgreSQL")
-con <- dbConnect(drv, dbname = "obesity", host = 'benzina')
+pacman::p_load(ggplot2,RPostgreSQL,cluster,splines,kml,
+               longitudinalData,maps,mapdata,maptools,stringr,
+               data.table,dplyr,reshape2,multiwayvcov,lmtest)
 
-dat <- dbGetQuery(con, paste("SELECT week, periodid, rls_code,  
-                  bannerid, storeid,
-                  serv_price_correct,
-                  bin, itemdesc, type,
-                  weight FROM deepa.fv_servingprice_geom_stdbasket_wts 
-                  WHERE bannerid <> '377' AND pharmacy = 'FALSE';"))
+###Reformat Census Data and Expand to All time Points
+###Expand census data to all time points
+census.ts <- expand.grid(rls_code = census$rls_code, year=seq(2006,2013))
+census.ts %>% filter(rls_code=="0505") %>% arrange(rls_code)
+census.long <- data.frame(rls_code = c(census$rls_code,census$rls_code), 
+                          year = sort(rep(c(2006,2011),nrow(census))), 
+                          pop = c(census$pop06, census$pop11), 
+                          quintmat = c(census$quintmat06, census$quintmat11), 
+                          area = c(census$area, census$area),
+                          zone11 = c(census$zone11, census$zone11))
+pop.model <- lm(log(pop) ~ year*rls_code, data = census.long)
+dep.model <- lm(log(quintmat) ~ year*rls_code, data = census.long)
+census.ts$predict.pop <- exp(predict(pop.model, newdata = census.ts , type="response"))
+census.ts$quintmat <- exp(predict(dep.model, newdata = census.ts , type="response"))
+areas = census.long %>% group_by(rls_code) %>% summarise(area = mean(area))
+census.ts = left_join(census.ts, areas)
+zones = census.long %>% select(rls_code, zone11) %>% distinct()
+census.ts = left_join(census.ts, zones)
+census.ts$pop.density <- census.ts$predict.pop/census.ts$area
 
-dmti = dbGetQuery(con, "SELECT poi_id, store, year, 
-                        supercentre, convenience, 
-                        supermarket, grocery, produce, 
-                        fastfood, pharmacy, 
-                        remove, marche, alimentation, 
-                        rls_code FROM deepa.dmti_full_correct;")
-
-OK <- dbDisconnect(con);
-
-###Monthly exchange rates
+###Join Monthly U.S. exchange rates
 exchange.rates = read.csv('exchange.rates.formatted.csv', header = TRUE)
 exchange.rates$date = as.Date(exchange.rates$date, format = "%Y-%m-%d")
 exchange.rates$year <- strftime(exchange.rates$date, format = "%Y")
@@ -48,10 +41,9 @@ dat$month = strftime(dat$periodid, format = '%m'); dat$year = strftime(dat$perio
 dat <- dat %>% left_join(cpi, c("type","month","year"))
 dat = dat %>% select(-date)
 
-dat = dat %>% left_join(month.cpi, c("month", "type"))
+dat = dat %>% left_join(cpi.monthly.means, c("month", "type"))
 dat = dat %>% select(-year.y) %>% rename(year = year.x)
 dat$real.price = dat$serv_price_correct*dat$mean.month.cpi/dat$cpi 
-
 
 ##Truncate the bins based on low and high prices##
 bin.split = split(dat, dat$bin, drop = TRUE)
@@ -80,29 +72,36 @@ standardize.price = function(x,lower.range = 0.05, upper.range = 0.95){
 
 outlier.items = sapply(bin.split, function(x) standardize.price(x)[2]) 
 outlier.vector = as.vector(unlist(outlier.items))
-
 prop.discard = length(outlier.vector)/length(unique(dat$itemdesc)) ##Per bin it is 10%
+
+outlier.items.s = sapply(bin.split, function(x) standardize.price(x,lower.range = 0.01, upper.range = 0.99)[2]) 
+outlier.vector.s = as.vector(unlist(outlier.items.s))
+prop.discard = length(outlier.vector.s)/length(unique(dat$itemdesc))  ##Per bin it is 4%
+
+dat.sensitivity = dat[!(dat$itemdesc %in% outlier.vector.s),]
 dat = dat[!(dat$itemdesc %in% outlier.vector),]
 
 
 # #############################Business directory data#############################
 ###Find duplicate POI_IDs and ID's with multiple RLS
 multiple.rls = dmti %>% group_by(poi_id) %>% count(count = n_distinct(rls_code)) %>% filter(count > 1)
-nrow(multiple.rls) ##Number with more than 1 RLS - EXCLUDE FOR NOW?
 dmti = dmti[!(dmti$poi_id %in% multiple.rls$poi_id ), ]
 
 ###Restrict to supermarket category non-2008
 all.dat.0913 = dmti[which(dmti$year != 2008),]
 supermarkets = all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),]
-nrow(supermarkets) == nrow(all.dat.0913[all.dat.0913$supermarket=='TRUE',])
 
 #Split by year
 yearly.supermarket = split(supermarkets, supermarkets$year)
 
 #For each year, randomly select x% in appropriate categories to become supermarkets, grocery, convenience and remove
 ##The initial probabilities are derived from the 2008 data validation
-a = 0.24; b = 0.27; c = 0.18; d = 0.23; e = 0.25; f = 0.15
-cats = c('supermarket','convenience', 'grocery', 'remove')
+true.numbers = read.csv('true-numbers.csv',header=TRUE)
+probs.alim = true.numbers$props[true.numbers$Var2=='alimentation']
+probs.marche= true.numbers$props[true.numbers$Var2=='marche']
+#a = 0.24; b = 0.27; c = 0.18; d = 0.23; e = 0.25; f = 0.15
+#cats = c('supermarket','convenience', 'grocery', 'remove')
+cats = c('convenience', 'grocery','supermarket', 'remove')
 probs.alim = c(1-sum(a,b,c),a,b,c)
 probs.marche = c(1-sum(d,e,f),d,e,f)
 
@@ -121,7 +120,6 @@ alim.data$grocery <- ifelse(alim.data$new.cat=='grocery', 'TRUE', 'FALSE')
 alim.data$convenience <- ifelse(alim.data$new.cat=='convenience', 'TRUE', 'FALSE')
 alim.data$remove <- ifelse(alim.data$new.cat=='remove', 'TRUE', 'FALSE')
 
-
 marche.data = x[which(x$marche=='TRUE' & is.na(x$store)),]
 total.marche = nrow(marche.data)
 
@@ -133,11 +131,14 @@ marche.data$convenience <- ifelse(marche.data$new.cat=='convenience', 'TRUE', 'F
 marche.data$remove <- ifelse(marche.data$new.cat=='remove', 'TRUE', 'FALSE')
 
 revised.dat = rbind(marche.data, alim.data)
-x = rbind(x,subset(revised.dat,select = -new.cat))
-x = x %>% arrange(poi_id) %>%
-  group_by(poi_id) %>%
-  filter(row_number() == 1)
 
+x = data.frame(rbind(x %>% data.frame(),subset(revised.dat,select = -new.cat))) %>% data.frame()
+
+x = x %>% arrange(poi_id) %>%
+  group_by(poi_id) %>% arrange(supermarket) %>%
+  filter(row_number() == 1) %>% data.frame()
+
+nrow(x) == original.rows
 if (nrow(x) != original.rows) warning('not adding up')
 
 return(x)
@@ -147,9 +148,44 @@ return(x)
 ###Generate new data
 new.0913 = do.call(rbind,lapply(yearly.supermarket,replace.rows))
 nrow(all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),]) == nrow(new.0913)
-###replace 2009-2013 supermarket data
 all.dat.0913[which(all.dat.0913$supermarket=='TRUE'),] <- new.0913
-nrow(all.dat.0913[all.dat.0913$supermarket=='TRUE',]) == nrow(new.0913)
 ###replace primary data
 dmti[dmti$year != 2008 & dmti$supermarket=='TRUE',] <- new.0913
-head(dmti)
+##EXCLUDE WAL-MART
+dmti$store <- gsub("^$|^ $", NA, dmti$store)
+dmti = dmti[!(dmti$store %in% "WALMART"),]
+
+####Fix other mis-classified supermarket
+chain.counts = dmti %>% filter(supermarket=="TRUE") %>% group_by(store,year) %>% summarise(count=n()) %>% data.frame()
+dmti$pharmacy[which(dmti$store=="UNIPRIX" & dmti$supermarket=="TRUE")] <- TRUE
+dmti$supermarket[which(dmti$store=="UNIPRIX" & dmti$supermarket=="TRUE")] <- FALSE
+
+convenience = c("SERVI EXPRESS","SHELL","GAZ")
+dmti$convenience[which(dmti$store %in% convenience & dmti$supermarket=="TRUE")] <- TRUE
+dmti$supermarket[which(dmti$store %in% convenience & dmti$supermarket=="TRUE")] <- FALSE
+
+fastfood = c("CASSE CROUTE","HARVEY","RESTAURANT")
+dmti$fastfood[which(dmti$store %in% fastfood & dmti$supermarket=="TRUE")] <- TRUE
+dmti$supermarket[which(dmti$store %in% fastfood & dmti$supermarket=="TRUE")] <- FALSE
+
+dmti$supercentre[which(dmti$store=="CLUB ENTREPOT" & dmti$supermarket=="TRUE")] <- TRUE
+dmti$supermarket[which(dmti$store=="CLUB ENTREPOT" & dmti$supermarket=="TRUE")] <- FALSE
+
+##Re-name misspelt stores
+dmti$store[dmti$store=="METRO "] <- "METRO"
+dmti$store[dmti$store=="METRO PLUS "] <- "METRO PLUS"
+
+to.remove = c("SUCCURSALE","INFORMATIONINFROMATION",
+              "LIVRAISONDELIVERY","FLEURFLOWER","DOLLA","DOLLAR","CATERERTRAITEUR","GALER")
+dmti$remove[which(dmti$store %in% to.remove)] <- TRUE
+
+dmti <- dmti[which(dmti$remove==FALSE | dmti$remove=="ADDITIONAL"),]
+
+rm(all.dat.0913,yearly.supermarket,
+        new.0913,bin.split, supermarkets, 
+        cats, multiple.rls, pop.model,
+        dep.model,areas,zones,census.long,outlier.vector,probs.alim,probs.marche,
+        convenience,fastfood,to.remove)
+
+
+save.image('data.RData')
